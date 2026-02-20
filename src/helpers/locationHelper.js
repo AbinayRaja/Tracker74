@@ -146,41 +146,69 @@ export const getRoutePolyline = async (
 
   return null;
 };
-export const getRoadDistanceKm = async (
+
+
+export const getRoadRoute = async (
   originLat: number,
   originLng: number,
   destLat: number,
   destLng: number,
-): Promise<number> => {
-
-  const API_KEY = "AIzaSyA02lUPnWpLfGUPeliw3RBHYrszdobP38U";
-
-  const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${originLat},${originLng}&destination=${destLat},${destLng}&key=${API_KEY}`;
-
+) => {
   try {
-    const res = await fetch(url);
-    const json = await res.json();
+    const url = `https://router.project-osrm.org/route/v1/driving/${originLng},${originLat};${destLng},${destLat}?overview=full&geometries=polyline`;
 
-    if (json.routes.length) {
-      const encoded = json.routes[0].overview_polyline.points;
-      const decoded = polyline.decode(encoded);
+    const response = await fetch(url);
+    const json = await response.json();
 
-      let total = 0;
-
-      for (let i = 1; i < decoded.length; i++) {
-        const [lat1, lng1] = decoded[i - 1];
-        const [lat2, lng2] = decoded[i];
-
-        total += calculateDistanceKm(lat1, lng1, lat2, lng2);
-      }
-
-      return Math.round(total * 100) / 100;
+    if (!json.routes || json.routes.length === 0) {
+      return null;
     }
 
-    return 0;
+    const route = json.routes[0];
 
-  } catch (err) {
-    console.log("Road distance error:", err);
-    return 0;
+    return {
+      distanceKm: route.distance / 1000,
+      durationMin: route.duration / 60,
+      geometry: route.geometry,
+    };
+  } catch (error) {
+    console.log('OSRM Error:', error);
+    return null;
+  }
+};
+
+export const getRoadDistanceKm = async (
+  originLat,
+  originLng,
+  destLat,
+  destLng
+) => {
+  try {
+    console.log(originLat, 'originLat');
+    console.log(originLng, 'originLng');
+    console.log(destLat, 'destLat');
+    console.log(destLng, 'destLng');
+
+
+
+
+    const url = `https://router.project-osrm.org/route/v1/driving/${originLng},${originLat};${destLng},${destLat}?overview=false`;
+
+    const response = await fetch(url);
+    const json = await response.json();
+
+    if (!json.routes || json.routes.length === 0) {
+      return null;
+    }
+
+    const route = json.routes[0];
+
+    return {
+      distanceKm: route.distance / 1000,
+      durationMin: route.duration / 60,
+    };
+  } catch (error) {
+    console.log("OSRM Error:", error);
+    return null;
   }
 };

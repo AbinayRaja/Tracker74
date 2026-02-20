@@ -1,4 +1,4 @@
-import React, {useState, useEffect, useRef} from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -7,23 +7,27 @@ import {
   Alert,
   ScrollView,
 } from 'react-native';
-import {useNavigation} from '@react-navigation/native';
+import { useNavigation } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import MapView, {Polyline, Marker} from 'react-native-maps';
+import MapView, { Polyline, Marker } from 'react-native-maps';
 
+// import {
+//   requestLocationPermission,
+//   fetchLocation,
+//   getAddressFromCoords,
+//   getRoadDistanceKm,
+//   startTracking,
+// } from '../helpers/locationHelper';
+import styles from '../styles/checkinStyles';
 import {
   requestLocationPermission,
   fetchLocation,
   getAddressFromCoords,
-  getRoadDistanceKm,
+  getRoadRoute,
   startTracking,
 } from '../helpers/locationHelper';
-import styles from '../styles/checkinStyles';
-import CheckIn from '../assets/checkinMap.jpg';
-import {
-  calculateTimeDifference,
-  calculateDistanceKm,
-} from '../helpers/calculateKm';
+
+import polyline from '@mapbox/polyline';
 
 // Storage key
 const CHECKIN_HISTORY_KEY = '@checkin_history';
@@ -38,10 +42,10 @@ interface CheckRecord {
   };
 }
 
-const Checkin = ({route}) => {
-  const {userName} = route.params;
+const Checkin = ({ route }) => {
+  const { userName } = route.params;
   const navigation = useNavigation();
-
+  const [routePolyline, setRoutePolyline] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [latestRecord, setLatestRecord] = useState<CheckRecord | null>(null);
   const [lastCheckIn, setLastCheckIn] = useState<CheckRecord | null>(null);
@@ -154,7 +158,7 @@ const Checkin = ({route}) => {
           coords.longitude,
         );
         if (response && typeof response === 'object' && response.data) {
-          const {suburb = '', city_district = '', city = ''} = response.data;
+          const { suburb = '', city_district = '', city = '' } = response.data;
           const parts = [suburb, city_district, city].filter(Boolean);
           if (parts.length > 0) {
             fullAddress = parts.join(', ');
@@ -202,71 +206,52 @@ const Checkin = ({route}) => {
         }
 
         if (lastCheckIn) {
-          const timeDiff = calculateTimeDifference(
-            lastCheckIn.timestamp,
-            newRecord.timestamp,
+
+          const result = await getRoadRoute(
+            lastCheckIn.coords.latitude,
+            lastCheckIn.coords.longitude,
+            newRecord.coords.latitude,
+            newRecord.coords.longitude,
           );
+          // const result = await getRoadRoute(
+          //   11.0437,  // Sitra
+          //   77.0384,
+          //   11.0183,  // Gandhipuram
+          //   76.9679
+          // );
 
-          const fullPath = [lastCheckIn, ...trackPoints, newRecord];
+          if (result) {
 
-          // let totalKm = 0;
+            // ✅ KM
+            const distance = Number(result.distanceKm.toFixed(2));
 
-          // for (let i = 1; i < fullPath.length; i++) {
-          //   const prev = fullPath[i - 1];
-          //   const curr = fullPath[i];
-
-          //   const segmentDistance = await getRoadDistanceKm(
-          //     prev.coords.latitude,
-          //     prev.coords.longitude,
-          //     curr.coords.latitude,
-          //     curr.coords.longitude,
-          //   );
-
-          //   totalKm += segmentDistance;
-          // }
-
-          // totalKm = Math.round(totalKm * 100) / 100;
-
-          // setSessionStats({
-          //   hours: timeDiff.hours,
-          //   minutes: timeDiff.minutes,
-          //   distanceKm: totalKm,
-          // });
-          if (lastCheckIn) {
-            const timeDiff = calculateTimeDifference(
-              lastCheckIn.timestamp,
-              newRecord.timestamp,
-            );
-
-            const totalKm = await getRoadDistanceKm(
-              lastCheckIn.coords.latitude,
-              lastCheckIn.coords.longitude,
-              newRecord.coords.latitude,
-              newRecord.coords.longitude,
-            );
-
-            const roundedKm = Math.round(totalKm * 100) / 100;
+            // ✅ Duration
+            const hours = Math.floor(result.durationMin / 60);
+            const minutes = Math.floor(result.durationMin % 60);
 
             setSessionStats({
-              hours: timeDiff.hours,
-              minutes: timeDiff.minutes,
-              distanceKm: roundedKm,
+              hours,
+              minutes,
+              distanceKm: distance,
             });
+
+            // ✅ Decode Polyline
+            const decoded = polyline.decode(result.geometry);
+
+            const routeCoords = decoded.map(point => ({
+              latitude: point[0],
+              longitude: point[1],
+            }));
+
+            setRoutePolyline(routeCoords);
 
             setLastCheckOut(newRecord);
 
             Alert.alert(
               'Check-out Successful',
-              `📍 ${fullAddress}\n\nTotal Distance: ${roundedKm} km`,
+              `Distance: ${distance} km\nDuration: ${hours} hrs ${minutes} mins`
             );
           }
-
-          // Alert.alert(
-          //   'Check-out Successful',
-          //   `📍 ${fullAddress}\n\nTotal distance: ${totalKm} km\n${new Date().toLocaleString(
-          //     'en-IN',
-          //   )}`,
-          // );
         }
       }
     } catch (err: any) {
@@ -282,12 +267,12 @@ const Checkin = ({route}) => {
   const buttonText = loading
     ? 'PROCESSING...'
     : nextAction === 'check-in'
-    ? 'CHECK-IN'
-    : 'CHECK-OUT';
+      ? 'CHECK-IN'
+      : 'CHECK-OUT';
   const testRoute = [
-    {latitude: 11.0813, longitude: 76.9999}, // Start - Saravanampatti
-    {latitude: 11.083, longitude: 77.0025}, // Mid point
-    {latitude: 11.085, longitude: 77.005}, // End point
+    { latitude: 11.0813, longitude: 76.9999 }, // Start - Saravanampatti
+    { latitude: 11.083, longitude: 77.0025 }, // Mid point
+    { latitude: 11.085, longitude: 77.005 }, // End point
   ];
 
   return (
@@ -314,7 +299,7 @@ const Checkin = ({route}) => {
           {/* <Image source={CheckIn} style={styles.map} /> */}
           {lastCheckIn && (
             <MapView
-              style={{height: 250, marginVertical: 12}}
+              style={{ height: 250, marginVertical: 12 }}
               initialRegion={{
                 latitude: lastCheckIn.coords.latitude,
                 longitude: lastCheckIn.coords.longitude,
@@ -344,20 +329,13 @@ const Checkin = ({route}) => {
               ))}
 
               {/* Polyline */}
-              <Polyline
-                coordinates={[
-                  {
-                    latitude: lastCheckIn.coords.latitude,
-                    longitude: lastCheckIn.coords.longitude,
-                  },
-                  ...trackPoints.map(p => ({
-                    latitude: p.coords.latitude,
-                    longitude: p.coords.longitude,
-                  })),
-                ]}
-                strokeWidth={4}
-                strokeColor="skyblue"
-              />
+              {routePolyline.length > 0 && (
+                <Polyline
+                  coordinates={routePolyline}
+                  strokeWidth={4}
+                  strokeColor="blue"
+                />
+              )}
             </MapView>
           )}
 
@@ -379,13 +357,13 @@ const Checkin = ({route}) => {
                   borderWidth: 1,
                   borderColor: '#86efac',
                 }}>
-                <Text style={{fontWeight: 'bold', color: '#15803d'}}>
+                <Text style={{ fontWeight: 'bold', color: '#15803d' }}>
                   Checked In
                 </Text>
-                <Text style={{color: '#4b5563', marginTop: 4, fontSize: 13}}>
+                <Text style={{ color: '#4b5563', marginTop: 4, fontSize: 13 }}>
                   {new Date(lastCheckIn.timestamp).toLocaleString('en-IN')}
                 </Text>
-                <Text style={{marginTop: 6, color: '#374151'}}>
+                <Text style={{ marginTop: 6, color: '#374151' }}>
                   📍 {lastCheckIn.address || 'Location not available'}
                 </Text>
               </View>
@@ -409,10 +387,10 @@ const Checkin = ({route}) => {
                     }}>
                     Checked Out
                   </Text>
-                  <Text style={{color: '#4b5563', marginTop: 4, fontSize: 13}}>
+                  <Text style={{ color: '#4b5563', marginTop: 4, fontSize: 13 }}>
                     {new Date(lastCheckOut.timestamp).toLocaleString('en-IN')}
                   </Text>
-                  <Text style={{marginTop: 6, color: '#374151'}}>
+                  <Text style={{ marginTop: 6, color: '#374151' }}>
                     📍 {lastCheckOut.address || 'Location not available'}
                   </Text>
                 </View>
@@ -428,16 +406,20 @@ const Checkin = ({route}) => {
                     borderColor: '#87cbf5',
                   }}>
                   <Text
-                    style={{color: '#1b3a99', fontWeight: '600', fontSize: 15}}>
+                    style={{ color: '#1b3a99', fontWeight: '600', fontSize: 15 }}>
                     Session Summary
                   </Text>
-                  <Text style={{color: '#374151', marginTop: 6, fontSize: 14}}>
-                    ⏱ Duration: {sessionStats.hours} hrs {sessionStats.minutes}{' '}
-                    min
-                  </Text>
-                  <Text style={{color: '#374151', marginTop: 4, fontSize: 14}}>
-                    🛣 Total distance travelled: {sessionStats.distanceKm} km
-                  </Text>
+                  {sessionStats && (
+                    <View>
+                      <Text>
+                        ⏱ Duration: {sessionStats.hours} hrs {sessionStats.minutes} min
+                      </Text>
+
+                      <Text>
+                        🛣 Total Distance: {sessionStats.distanceKm.toFixed(2)} km
+                      </Text>
+                    </View>
+                  )}
 
                   {/* View Route Map Button */}
                   {/* <TouchableOpacity
@@ -480,7 +462,7 @@ const Checkin = ({route}) => {
           <TouchableOpacity
             style={[
               styles.checkInBtn,
-              nextAction === 'check-out' && {backgroundColor: '#b91c1c'},
+              nextAction === 'check-out' && { backgroundColor: '#b91c1c' },
             ]}
             onPress={() => handleAction(nextAction)}
             disabled={loading}>
@@ -491,8 +473,8 @@ const Checkin = ({route}) => {
             {loading
               ? 'Getting location...'
               : isLastCheckIn
-              ? 'Tracking active...'
-              : ''}
+                ? 'Tracking active...'
+                : ''}
           </Text>
         </View>
       </View>
