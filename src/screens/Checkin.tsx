@@ -222,10 +222,8 @@ const Checkin = ({ route }) => {
 
           if (result) {
 
-            // ✅ KM
             const distance = Number(result.distanceKm.toFixed(2));
 
-            // ✅ Duration
             const hours = Math.floor(result.durationMin / 60);
             const minutes = Math.floor(result.durationMin % 60);
 

@@ -1,4 +1,5 @@
 import { useNavigation } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import React, { useState } from 'react';
 import {
   View,
@@ -8,10 +9,11 @@ import {
   StyleSheet,
   Alert,
 } from 'react-native';
+import styles from '../styles/loginStyles';
 
 const Login = () => {
   const [name, setName] = useState('');
-const navigation = useNavigation();
+  const navigation = useNavigation<NativeStackNavigationProp<any>>();
 
 const handleContinue = () => {
   if (!name.trim()) {
@@ -21,8 +23,9 @@ const handleContinue = () => {
 
   console.log('User Name:', name);
 
-  navigation.replace('Checkin', {
-    userName: name,
+  navigation.replace('Home', {
+    screen: 'Checkin',
+    params: { userName: name },
   });
 };
   return (
@@ -46,40 +49,4 @@ const handleContinue = () => {
 
 export default Login;
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    justifyContent: 'center',
-    padding: 20,
-    backgroundColor: '#fff',
-  },
-  title: {
-    fontSize: 26,
-    fontWeight: 'bold',
-    textAlign: 'center',
-  },
-  subtitle: {
-    fontSize: 16,
-    textAlign: 'center',
-    marginVertical: 10,
-    color: '#666',
-  },
-  input: {
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 8,
-    padding: 12,
-    marginTop: 20,
-  },
-  button: {
-    backgroundColor: '#6FA3E7',
-    padding: 15,
-    borderRadius: 8,
-    marginTop: 20,
-  },
-  buttonText: {
-    color: '#fff',
-    textAlign: 'center',
-    fontWeight: 'bold',
-  },
-});
+

@@ -7,11 +7,11 @@
 #define TIMEOUT_SECONDS 600
 #define TEXT_TO_LOOK_FOR @"Welcome to React"
 
-@interface AwesomeLocationTests : XCTestCase
+@interface YFTrackerTests : XCTestCase
 
 @end
 
-@implementation AwesomeLocationTests
+@implementation YFTrackerTests
 
 - (BOOL)findSubviewInView:(UIView *)view matching:(BOOL (^)(UIView *view))test
 {

@@ -1,4 +1,4 @@
-package com.awesomelocation
+package com.YFTracker
 
 import android.app.Application
 import com.facebook.react.PackageList

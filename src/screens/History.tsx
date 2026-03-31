@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -10,189 +10,251 @@ import {
   ActivityIndicator,
   Dimensions,
 } from 'react-native';
+
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useFocusEffect as useNavigationFocusEffect } from '@react-navigation/native';
+import { useFocusEffect } from '@react-navigation/native';
 
-import MapComponent from '../components/MapComponent';
-import { calculateAverageSpeed, durationToMinutes } from '../helpers/calculateKm';
+import MapView, { Polyline, Marker } from 'react-native-maps';
+import polyline from '@mapbox/polyline';
 
-interface RouteRecord {
+import { getRoadRoute } from '../helpers/locationHelper';
+
+import {
+  calculateTimeDifference,
+  calculateTotalDistance,
+} from '../helpers/calculateKm';
+
+interface CheckRecord {
+  type: 'check-in' | 'check-out' | 'track';
+  timestamp: string;
+  address?: string;
+  coords: {
+    latitude: number;
+    longitude: number;
+  };
+}
+
+interface SessionRecord {
   id: string;
-  startPoint: { latitude: number; longitude: number; timestamp?: string };
-  endPoint: { latitude: number; longitude: number; timestamp?: string };
-  intermediatePoints: Array<{ latitude: number; longitude: number }>;
-  trackingPoints: Array<{ latitude: number; longitude: number; timestamp?: string }>;
-  totalDistance: number;
-  totalDuration: { hours: number; minutes: number };
+  checkIn: CheckRecord;
+  checkOut?: CheckRecord;
+  trackPoints: CheckRecord[];
+  sessionStats?: {
+    hours: number;
+    minutes: number;
+    distanceKm: number;
+  };
+  routePolyline?: { latitude: number; longitude: number }[];
   savedAt: string;
 }
 
+const CHECKIN_HISTORY_KEY = '@checkin_history';
+
 const History = () => {
-  const [routes, setRoutes] = useState<RouteRecord[]>([]);
+  const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  useNavigationFocusEffect(
-    React.useCallback(() => {
-      loadRouteHistory();
-    }, [])
+  // 🔍 Debug history (runs once)
+  useEffect(() => {
+    const checkHistory = async () => {
+      try {
+        const value = await AsyncStorage.getItem(CHECKIN_HISTORY_KEY);
+        console.log('Check-in History:', value);
+      } catch (e) {
+        console.log('Error reading history:', e);
+      }
+    };
+
+    checkHistory();
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadCheckinHistory();
+    }, []),
   );
 
-  const loadRouteHistory = async () => {
+  const loadCheckinHistory = async () => {
     try {
       setLoading(true);
-      const TRACKING_HISTORY_KEY = '@tracking_history';
-      const json = await AsyncStorage.getItem(TRACKING_HISTORY_KEY);
-      
+
+      const json = await AsyncStorage.getItem(CHECKIN_HISTORY_KEY);
+
       if (json) {
-        const history = JSON.parse(json);
-        const routesWithId = history.map((route, index) => ({
-          ...route,
-          id: `${route.savedAt}-${index}`,
-        }));
-        setRoutes(routesWithId.reverse()); // Show newest first
+        const history: CheckRecord[] = JSON.parse(json);
+
+        const groupedSessions = await groupIntoSessions(history);
+
+        setSessions(groupedSessions.reverse());
+      } else {
+        setSessions([]);
       }
     } catch (err) {
-      console.error('Failed to load route history:', err);
-      Alert.alert('Error', 'Failed to load route history');
+      console.error('Failed to load history:', err);
+      Alert.alert('Error', 'Failed to load history');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleDeleteRoute = (routeId: string) => {
-    Alert.alert(
-      'Delete Route',
-      'Are you sure you want to delete this route?',
-      [
-        { text: 'Cancel', onPress: () => {} },
-        {
-          text: 'Delete',
-          onPress: async () => {
-            try {
-              const TRACKING_HISTORY_KEY = '@tracking_history';
-              let history = [];
-              const json = await AsyncStorage.getItem(TRACKING_HISTORY_KEY);
-              if (json) history = JSON.parse(json);
+  const groupIntoSessions = async (
+    history: CheckRecord[],
+  ): Promise<SessionRecord[]> => {
+    const sessions: SessionRecord[] = [];
+    let currentSession: SessionRecord | null = null;
 
-              // Remove the deleted route
-              const updatedHistory = history.filter(
-                (_, index) => `${history[index].savedAt}-${index}` !== routeId
-              );
+    for (let i = 0; i < history.length; i++) {
+      const record = history[i];
 
-              await AsyncStorage.setItem(
-                TRACKING_HISTORY_KEY,
-                JSON.stringify(updatedHistory)
-              );
+      if (record.type === 'check-in') {
+        if (currentSession) sessions.push(currentSession);
 
-              setRoutes((prev) => prev.filter((r) => r.id !== routeId));
-              Alert.alert('Success', 'Route deleted successfully');
-            } catch (err) {
-              console.error('Failed to delete route:', err);
-              Alert.alert('Error', 'Failed to delete route');
-            }
-          },
-        },
-      ]
-    );
+        currentSession = {
+          id: `${record.timestamp}-${i}`,
+          checkIn: record,
+          trackPoints: [],
+          savedAt: record.timestamp,
+        };
+      }
+
+      else if (record.type === 'track' && currentSession) {
+        currentSession.trackPoints.push(record);
+      }
+
+      else if (record.type === 'check-out' && currentSession) {
+
+        currentSession.checkOut = record;
+        currentSession.savedAt = record.timestamp;
+
+        const duration = calculateTimeDifference(
+          currentSession.checkIn.timestamp,
+          record.timestamp
+        );
+
+        currentSession.sessionStats = {
+          hours: duration.hours,
+          minutes: duration.minutes,
+          distanceKm: 0,
+        };
+
+        // 🛣 road route
+        try {
+
+          const roadResult = await getRoadRoute(
+            currentSession.checkIn.coords.latitude,
+            currentSession.checkIn.coords.longitude,
+            record.coords.latitude,
+            record.coords.longitude
+          );
+
+          if (roadResult) {
+
+            currentSession.sessionStats.distanceKm =
+              Number(roadResult.distanceKm.toFixed(2));
+
+            const decoded = polyline.decode(roadResult.geometry);
+
+            currentSession.routePolyline = decoded.map(p => ({
+              latitude: p[0],
+              longitude: p[1],
+            }));
+
+          } else {
+
+            const allPoints = [
+              currentSession.checkIn.coords,
+              ...currentSession.trackPoints.map(p => p.coords),
+              record.coords,
+            ];
+
+            currentSession.sessionStats.distanceKm =
+              calculateTotalDistance(allPoints);
+
+          }
+
+        } catch (err) {
+          console.log('Route calculation error:', err);
+        }
+
+        sessions.push(currentSession);
+        currentSession = null;
+      }
+    }
+
+    if (currentSession) {
+      sessions.push(currentSession);
+    }
+
+    return sessions;
   };
 
-  const handleExportRoute = (route: RouteRecord) => {
-    const routeData = {
-      distance: `${route.totalDistance} km`,
-      duration: `${route.totalDuration.hours}h ${route.totalDuration.minutes}m`,
-      speed: `${calculateAverageSpeed(route.totalDistance, durationToMinutes(route.totalDuration))} km/h`,
-      points: route.trackingPoints.length,
-      date: new Date(route.savedAt).toLocaleString('en-IN'),
-    };
+  const renderSessionItem = ({ item }: { item: SessionRecord }) => {
 
-    Alert.alert('Route Details', JSON.stringify(routeData, null, 2));
-  };
-
-  const renderRouteItem = ({ item }: { item: RouteRecord }) => {
     const isExpanded = expandedId === item.id;
-    const avgSpeed = calculateAverageSpeed(
-      item.totalDistance,
-      durationToMinutes(item.totalDuration)
-    );
-    const date = new Date(item.savedAt);
+    const stats = item.sessionStats || { hours: 0, minutes: 0, distanceKm: 0 };
 
     return (
-      <View style={styles.routeCard}>
+      <View style={styles.sessionCard}>
+
         <TouchableOpacity
           onPress={() => setExpandedId(isExpanded ? null : item.id)}
-          style={styles.routeHeader}
-        >
-          <View style={styles.routeInfo}>
-            <Text style={styles.routeDate}>
-              📅 {date.toLocaleDateString('en-IN')}
+          style={styles.sessionHeader}>
+
+          <View>
+            <Text style={styles.sessionDate}>
+              📅 {new Date(item.checkIn.timestamp).toLocaleDateString('en-IN')}
             </Text>
-            <Text style={styles.routeTime}>
-              ⏰ {date.toLocaleTimeString('en-IN')}
-            </Text>
-          </View>
-          <View style={styles.routeStats}>
-            <Text style={styles.routeStat}>
-              📍 {item.totalDistance.toFixed(2)} km
-            </Text>
-            <Text style={styles.routeStat}>
-              ⏱ {item.totalDuration.hours}h {item.totalDuration.minutes}m
+
+            <Text style={styles.sessionTime}>
+              ⏰ {new Date(item.checkIn.timestamp).toLocaleTimeString('en-IN')}
             </Text>
           </View>
+
+          <View>
+            <Text style={styles.statText}>
+              📍 {stats.distanceKm.toFixed(2)} km
+            </Text>
+
+            <Text style={styles.statText}>
+              ⏱ {stats.hours}h {stats.minutes}m
+            </Text>
+          </View>
+
         </TouchableOpacity>
 
         {isExpanded && (
-          <View style={styles.expandedContent}>
-            {/* Map Component */}
-            <View style={styles.mapContainer}>
-              <MapComponent
-                trackPoints={item.intermediatePoints}
-                startPoint={item.startPoint}
-                endPoint={item.endPoint}
-                totalDistance={item.totalDistance}
-                duration={item.totalDuration}
-                isLiveTracking={false}
-              />
-            </View>
+          <View style={styles.mapContainer}>
 
-            {/* Detailed Stats */}
-            <View style={styles.detailedStats}>
-              <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Total Distance:</Text>
-                <Text style={styles.statValue}>{item.totalDistance.toFixed(2)} km</Text>
-              </View>
-              <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Duration:</Text>
-                <Text style={styles.statValue}>
-                  {item.totalDuration.hours}h {item.totalDuration.minutes}m
-                </Text>
-              </View>
-              <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Average Speed:</Text>
-                <Text style={styles.statValue}>{avgSpeed.toFixed(2)} km/h</Text>
-              </View>
-              <View style={styles.statRow}>
-                <Text style={styles.statLabel}>GPS Points:</Text>
-                <Text style={styles.statValue}>{item.trackingPoints.length}</Text>
-              </View>
-            </View>
+            <MapView
+              style={styles.map}
+              initialRegion={{
+                latitude: item.checkIn.coords.latitude,
+                longitude: item.checkIn.coords.longitude,
+                latitudeDelta: 0.05,
+                longitudeDelta: 0.05,
+              }}>
 
-            {/* Action Buttons */}
-            <View style={styles.actionButtons}>
-              <TouchableOpacity
-                style={[styles.actionBtn, styles.exportBtn]}
-                onPress={() => handleExportRoute(item)}
-              >
-                <Text style={styles.actionBtnText}>📊 EXPORT</Text>
-              </TouchableOpacity>
+              <Marker coordinate={item.checkIn.coords} pinColor="green" />
 
-              <TouchableOpacity
-                style={[styles.actionBtn, styles.deleteBtn]}
-                onPress={() => handleDeleteRoute(item.id)}
-              >
-                <Text style={styles.actionBtnText}>🗑 DELETE</Text>
-              </TouchableOpacity>
-            </View>
+              {item.trackPoints.map((p, i) => (
+                <Marker key={i} coordinate={p.coords} pinColor="blue" />
+              ))}
+
+              {item.checkOut && (
+                <Marker coordinate={item.checkOut.coords} pinColor="red" />
+              )}
+
+              {item.routePolyline && (
+                <Polyline
+                  coordinates={item.routePolyline}
+                  strokeWidth={4}
+                  strokeColor="#3b82f6"
+                />
+              )}
+
+            </MapView>
+
           </View>
         )}
       </View>
@@ -203,40 +265,34 @@ const History = () => {
     return (
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color="#3b82f6" />
-        <Text style={styles.loadingText}>Loading routes...</Text>
       </View>
     );
   }
 
   return (
     <SafeAreaView style={styles.container}>
+
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Route History</Text>
-        <TouchableOpacity
-          style={styles.refreshBtn}
-          onPress={loadRouteHistory}
-        >
-          <Text style={styles.refreshBtnText}>🔄</Text>
-        </TouchableOpacity>
+        <Text style={styles.headerTitle}>Check-in History</Text>
       </View>
 
-      {routes.length === 0 ? (
+      {sessions.length === 0 ? (
+
         <View style={styles.emptyState}>
-          <Text style={styles.emptyStateIcon}>📍</Text>
-          <Text style={styles.emptyStateText}>No routes tracked yet</Text>
-          <Text style={styles.emptyStateSubtext}>
-            Start tracking to see your routes here
-          </Text>
+          <Text style={{ fontSize: 40 }}>📍</Text>
+          <Text>No history yet</Text>
         </View>
+
       ) : (
+
         <FlatList
-          data={routes}
-          renderItem={renderRouteItem}
-          keyExtractor={(item) => item.id}
-          contentContainerStyle={styles.listContent}
-          onEndReachedThreshold={0.1}
+          data={sessions}
+          renderItem={renderSessionItem}
+          keyExtractor={item => item.id}
         />
+
       )}
+
     </SafeAreaView>
   );
 };
@@ -244,171 +300,72 @@ const History = () => {
 const { height } = Dimensions.get('window');
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#f9fafb',
-  },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    backgroundColor: '#fff',
-    borderBottomWidth: 1,
-    borderBottomColor: '#e5e7eb',
-  },
-  headerTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#1f2937',
-  },
-  refreshBtn: {
-    width: 40,
-    height: 40,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderRadius: 8,
-    backgroundColor: '#eff6ff',
-  },
-  refreshBtnText: {
-    fontSize: 20,
-  },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#fff',
-  },
-  loadingText: {
-    marginTop: 12,
-    fontSize: 14,
-    color: '#6b7280',
-    fontWeight: '500',
-  },
-  emptyState: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 32,
-  },
-  emptyStateIcon: {
-    fontSize: 48,
-    marginBottom: 16,
-  },
-  emptyStateText: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#1f2937',
-    marginBottom: 8,
-    textAlign: 'center',
-  },
-  emptyStateSubtext: {
-    fontSize: 14,
-    color: '#6b7280',
-    textAlign: 'center',
-  },
-  listContent: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  routeCard: {
-    marginVertical: 8,
-    backgroundColor: '#fff',
-    borderRadius: 8,
-    overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
-    elevation: 2,
-  },
-  routeHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 12,
-    paddingHorizontal: 12,
-    backgroundColor: '#f3f4f6',
-  },
-  routeInfo: {
-    flex: 1,
-  },
-  routeDate: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#1f2937',
-    marginBottom: 4,
-  },
-  routeTime: {
-    fontSize: 12,
-    color: '#6b7280',
-  },
-  routeStats: {
-    alignItems: 'flex-end',
-  },
-  routeStat: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#374151',
-    marginBottom: 2,
-  },
-  expandedContent: {
-    borderTopWidth: 1,
-    borderTopColor: '#e5e7eb',
-  },
-  mapContainer: {
-    height: height * 0.35,
-    backgroundColor: '#f0f9ff',
-    borderBottomWidth: 1,
-    borderBottomColor: '#e5e7eb',
-  },
-  detailedStats: {
-    paddingVertical: 12,
-    paddingHorizontal: 12,
-    backgroundColor: '#eff6ff',
-  },
-  statRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginVertical: 6,
-  },
-  statLabel: {
-    fontSize: 13,
-    color: '#6b7280',
-    fontWeight: '500',
-  },
-  statValue: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: '#1f2937',
-  },
-  actionButtons: {
-    flexDirection: 'row',
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    gap: 8,
-  },
-  actionBtn: {
-    flex: 1,
-    paddingVertical: 10,
-    borderRadius: 6,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  exportBtn: {
-    backgroundColor: '#10b981',
-  },
-  deleteBtn: {
-    backgroundColor: '#ef4444',
-  },
-  actionBtnText: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#fff',
-  },
+
+container:{backgroundColor:'#f9fafb'},
+
+header:{
+// padding:16,
+backgroundColor:'#fff',
+// borderBottomWidth:1,
+borderColor:'#e5e7eb'
+},
+
+headerTitle:{
+fontSize:18,
+fontWeight:'700'
+},
+
+sessionCard:{
+margin:10,
+backgroundColor:'#fff',
+borderRadius:8,
+overflow:'hidden',
+borderWidth:1,
+borderColor:'#e5e7eb'
+},
+
+sessionHeader:{
+flexDirection:'row',
+justifyContent:'space-between',
+padding:16,
+backgroundColor:'#f3f4f6'
+},
+
+sessionDate:{
+fontSize:14,
+fontWeight:'600'
+},
+
+sessionTime:{
+fontSize:12,
+color:'#6b7280'
+},
+
+statText:{
+fontSize:13,
+fontWeight:'600'
+},
+
+mapContainer:{
+height:height*0.3
+},
+
+map:{
+flex:1
+},
+
+loadingContainer:{
+flex:1,
+justifyContent:'center',
+alignItems:'center'
+},
+
+emptyState:{
+flex:1,
+justifyContent:'center',
+alignItems:'center'
+}
+
 });
 
 export default History;
