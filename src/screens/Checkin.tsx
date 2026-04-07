@@ -3,22 +3,15 @@ import {
   View,
   Text,
   TouchableOpacity,
-  Image,
   Alert,
   ScrollView,
+  StyleSheet,
+  ActivityIndicator,
 } from 'react-native';
-import { useNavigation } from '@react-navigation/native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import MapView, { Polyline, Marker } from 'react-native-maps';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import polyline from '@mapbox/polyline';
 
-// import {
-//   requestLocationPermission,
-//   fetchLocation,
-//   getAddressFromCoords,
-//   getRoadDistanceKm,
-//   startTracking,
-// } from '../helpers/locationHelper';
-import styles from '../styles/checkinStyles';
 import {
   requestLocationPermission,
   fetchLocation,
@@ -27,457 +20,502 @@ import {
   startTracking,
 } from '../helpers/locationHelper';
 
-import polyline from '@mapbox/polyline';
-
-// Storage key
-const CHECKIN_HISTORY_KEY = '@checkin_history';
+// ─── Types ────────────────────────────────────────────────────────────────
+interface Coords { latitude: number; longitude: number; }
 
 interface CheckRecord {
   type: 'check-in' | 'check-out' | 'track';
   timestamp: string;
-  address?: string; // only for check-in / check-out
-  coords: {
-    latitude: number;
-    longitude: number;
-  };
+  address?: string;
+  coords: Coords;
 }
 
-const Checkin = ({ route }) => {
-  const { userName } = route.params;
-  const navigation = useNavigation();
-  const [routePolyline, setRoutePolyline] = useState<any[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [latestRecord, setLatestRecord] = useState<CheckRecord | null>(null);
-  const [lastCheckIn, setLastCheckIn] = useState<CheckRecord | null>(null);
-  const [lastCheckOut, setLastCheckOut] = useState<CheckRecord | null>(null);
-  const [sessionStats, setSessionStats] = useState<{
-    hours: number;
-    minutes: number;
-    distanceKm: number;
-  } | null>(null);
-  const [displayAddress, setDisplayAddress] =
-    useState<string>('No location yet');
+// ─── Storage key ──────────────────────────────────────────────────────────
+const HISTORY_KEY = '@checkin_history';
 
-  // ── New states for full path tracking ──
-  const [trackPoints, setTrackPoints] = useState<CheckRecord[]>([]); // intermediate points only
+// ─── Helper: save one record to AsyncStorage ─────────────────────────────
+const persistRecord = async (record: CheckRecord) => {
+  try {
+    const raw = await AsyncStorage.getItem(HISTORY_KEY);
+    let history: CheckRecord[] = raw ? JSON.parse(raw) : [];
+    history.push(record);
+    // Keep last 500 records (check-in + track points + check-out)
+    if (history.length > 500) history = history.slice(-500);
+    await AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  } catch (e) {
+    console.error('persistRecord error:', e);
+  }
+};
+
+// ─── Component ────────────────────────────────────────────────────────────
+const Checkin = ({ route }: any) => {
+  const { userName } = route?.params ?? { userName: 'User' };
+
+  const [loading, setLoading] = useState(false);
+  const [statusText, setStatusText] = useState('');
+  const [displayAddress, setDisplayAddress] = useState('No location yet');
+
+  // Session state
+  const [isCheckedIn, setIsCheckedIn] = useState(false);
+  const [checkInRecord, setCheckInRecord] = useState<CheckRecord | null>(null);
+  const [checkOutRecord, setCheckOutRecord] = useState<CheckRecord | null>(null);
+  const [trackPoints, setTrackPoints] = useState<Coords[]>([]);
+  const [routeCoords, setRouteCoords] = useState<Coords[]>([]);
+  const [sessionStats, setSessionStats] = useState<{ hours: number; minutes: number; distanceKm: number } | null>(null);
+
   const stopTrackingRef = useRef<(() => void) | null>(null);
 
+  // ── On mount: restore last session state ──────────────────────────────
   useEffect(() => {
-    loadLatestCheckRecord();
+    (async () => {
+      const raw = await AsyncStorage.getItem(HISTORY_KEY);
+      if (!raw) return;
+      const history: CheckRecord[] = JSON.parse(raw);
 
-    // Cleanup on unmount
-    return () => {
-      if (stopTrackingRef.current) {
-        stopTrackingRef.current();
+      // Find the most recent check-in record
+      let lastCI: CheckRecord | null = null;
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].type === 'check-in') { lastCI = history[i]; break; }
       }
-    };
+      if (!lastCI) return;
+
+      // Check if there's a subsequent check-out
+      const ciIdx = history.lastIndexOf(lastCI);
+      const hasCheckOut = history.slice(ciIdx + 1).some(r => r.type === 'check-out');
+
+      if (!hasCheckOut) {
+        setIsCheckedIn(true);
+        setCheckInRecord(lastCI);
+        setDisplayAddress(lastCI.address ?? 'No address');
+
+        // Restore track points recorded after that check-in
+        const pts = history
+          .slice(ciIdx + 1)
+          .filter(r => r.type === 'track')
+          .map(r => r.coords);
+        setTrackPoints(pts);
+      }
+    })();
+
+    return () => { stopTrackingRef.current?.(); };
   }, []);
 
-  const loadLatestCheckRecord = async () => {
-    try {
-      const jsonValue = await AsyncStorage.getItem(CHECKIN_HISTORY_KEY);
-      if (jsonValue) {
-        const history: CheckRecord[] = JSON.parse(jsonValue);
-        if (history.length > 0) {
-          const latest = history[history.length - 1];
-          setLatestRecord(latest);
-          if (latest.address) {
-            setDisplayAddress(latest.address);
-          }
-
-          // Find most recent check-in
-          let checkIn: CheckRecord | null = null;
-          for (let i = history.length - 1; i >= 0; i--) {
-            if (history[i].type === 'check-in') {
-              checkIn = history[i];
-              break;
-            }
-          }
-          setLastCheckIn(checkIn);
-          setLastCheckOut(null);
-          setSessionStats(null);
-          setTrackPoints([]);
-        }
-      }
-    } catch (e) {
-      console.error('Failed to load history:', e);
-    }
-  };
-
-  const saveCheckRecord = async (record: CheckRecord) => {
-    try {
-      let history: CheckRecord[] = [];
-      const json = await AsyncStorage.getItem(CHECKIN_HISTORY_KEY);
-      if (json) {
-        history = JSON.parse(json);
-      }
-
-      history.push(record);
-      if (history.length > 60) {
-        history = history.slice(-60);
-      }
-
-      await AsyncStorage.setItem(CHECKIN_HISTORY_KEY, JSON.stringify(history));
-
-      setLatestRecord(record);
-      if (record.address) {
-        setDisplayAddress(record.address);
-      }
-
-      if (record.type === 'check-in') {
-        setLastCheckIn(record);
-        setLastCheckOut(null);
-        setSessionStats(null);
-        setTrackPoints([]);
-      } else if (record.type === 'check-out') {
-        setLastCheckOut(record);
-      }
-    } catch (e) {
-      console.error('Failed to save record:', e);
-    }
-  };
-
-  const handleAction = async (action: 'check-in' | 'check-out') => {
+  // ── Check In ──────────────────────────────────────────────────────────
+  const handleCheckIn = async () => {
     setLoading(true);
-
+    setStatusText('Getting your location…');
     try {
       const hasPermission = await requestLocationPermission();
       if (!hasPermission) {
         Alert.alert('Permission Denied', 'Location permission is required.');
-        setLoading(false);
         return;
       }
 
       const coords = await fetchLocation();
-      let fullAddress = 'Could not get address';
-      console.log(coords, 'coords');
+      let address = 'Could not get address';
 
       try {
-        const response = await getAddressFromCoords(
-          coords.latitude,
-          coords.longitude,
-        );
-        if (response && typeof response === 'object' && response.data) {
-          const { suburb = '', city_district = '', city = '' } = response.data;
+        const res = await getAddressFromCoords(coords.latitude, coords.longitude);
+        if (res?.data) {
+          const { suburb = '', city_district = '', city = '' } = res.data;
           const parts = [suburb, city_district, city].filter(Boolean);
-          if (parts.length > 0) {
-            fullAddress = parts.join(', ');
-          }
+          if (parts.length) address = parts.join(', ');
         }
-      } catch (addrErr) {
-        console.log('Address fetch failed:', addrErr);
-      }
+      } catch (_) { }
 
-      const newRecord: CheckRecord = {
-        type: action,
+      const record: CheckRecord = {
+        type: 'check-in',
         timestamp: new Date().toISOString(),
-        address: fullAddress,
-        coords: {
-          latitude: coords.latitude,
-          longitude: coords.longitude,
-        },
+        address,
+        coords: { latitude: coords.latitude, longitude: coords.longitude },
       };
 
-      await saveCheckRecord(newRecord);
+      await persistRecord(record);
 
-      if (action === 'check-in') {
-        const stopFn = startTracking((newCoords, ts) => {
-          const trackRec: CheckRecord = {
-            type: 'track',
-            timestamp: ts,
-            coords: {
-              latitude: newCoords.latitude,
-              longitude: newCoords.longitude,
-            },
-          };
-          setTrackPoints(prev => [...prev, trackRec]);
-        });
+      setCheckInRecord(record);
+      setCheckOutRecord(null);
+      setTrackPoints([]);
+      setRouteCoords([]);
+      setSessionStats(null);
+      setIsCheckedIn(true);
+      setDisplayAddress(address);
 
-        stopTrackingRef.current = stopFn;
+      // Start background tracking — each new point saved to history
+      const stop = startTracking(async (newCoords, ts) => {
+        const trackRec: CheckRecord = {
+          type: 'track',
+          timestamp: ts,
+          coords: { latitude: newCoords.latitude, longitude: newCoords.longitude },
+        };
+        await persistRecord(trackRec);
+        setTrackPoints(prev => [...prev, trackRec.coords]);
+      });
+      stopTrackingRef.current = stop;
 
-        Alert.alert(
-          'Check-in Successful',
-          `📍 ${fullAddress}\n\n${new Date().toLocaleString('en-IN')}`,
-        );
-      } else {
-        if (stopTrackingRef.current) {
-          stopTrackingRef.current();
-          stopTrackingRef.current = null;
-        }
-
-        if (lastCheckIn) {
-
-          const result = await getRoadRoute(
-            lastCheckIn.coords.latitude,
-            lastCheckIn.coords.longitude,
-            newRecord.coords.latitude,
-            newRecord.coords.longitude,
-          );
-          // const result = await getRoadRoute(
-          //   11.0437,  // Sitra
-          //   77.0384,
-          //   11.0183,  // Gandhipuram
-          //   76.9679
-          // );
-
-          if (result) {
-
-            const distance = Number(result.distanceKm.toFixed(2));
-
-            const hours = Math.floor(result.durationMin / 60);
-            const minutes = Math.floor(result.durationMin % 60);
-
-            setSessionStats({
-              hours,
-              minutes,
-              distanceKm: distance,
-            });
-
-            // ✅ Decode Polyline
-            const decoded = polyline.decode(result.geometry);
-
-            const routeCoords = decoded.map(point => ({
-              latitude: point[0],
-              longitude: point[1],
-            }));
-
-            setRoutePolyline(routeCoords);
-
-            setLastCheckOut(newRecord);
-
-            Alert.alert(
-              'Check-out Successful',
-              `Distance: ${distance} km\nDuration: ${hours} hrs ${minutes} mins`
-            );
-          }
-        }
-      }
+      Alert.alert('Checked In ✅', `📍 ${address}\n${new Date().toLocaleString('en-IN')}`);
     } catch (err: any) {
-      console.error('Action failed:', err);
-      Alert.alert('Error', err.message || 'Something went wrong. Try again.');
+      Alert.alert('Error', err.message ?? 'Failed to check in. Try again.');
     } finally {
       setLoading(false);
+      setStatusText('');
     }
   };
 
-  const isLastCheckIn = latestRecord?.type === 'check-in';
-  const nextAction = isLastCheckIn ? 'check-out' : 'check-in';
-  const buttonText = loading
-    ? 'PROCESSING...'
-    : nextAction === 'check-in'
-      ? 'CHECK-IN'
-      : 'CHECK-OUT';
-  const testRoute = [
-    { latitude: 11.0813, longitude: 76.9999 }, // Start - Saravanampatti
-    { latitude: 11.083, longitude: 77.0025 }, // Mid point
-    { latitude: 11.085, longitude: 77.005 }, // End point
-  ];
+  // ── Check Out ─────────────────────────────────────────────────────────
+  const handleCheckOut = async () => {
+    setLoading(true);
+    setStatusText('Calculating your route…');
+    try {
+      stopTrackingRef.current?.();
+      stopTrackingRef.current = null;
+
+      const coords = await fetchLocation();
+      let address = 'Could not get address';
+
+      try {
+        const res = await getAddressFromCoords(coords.latitude, coords.longitude);
+        if (res?.data) {
+          const { suburb = '', city_district = '', city = '' } = res.data;
+          const parts = [suburb, city_district, city].filter(Boolean);
+          if (parts.length) address = parts.join(', ');
+        }
+      } catch (_) { }
+
+      const record: CheckRecord = {
+        type: 'check-out',
+        timestamp: new Date().toISOString(),
+        address,
+        coords: { latitude: coords.latitude, longitude: coords.longitude },
+      };
+
+      await persistRecord(record);
+      setCheckOutRecord(record);
+      setIsCheckedIn(false);
+      setDisplayAddress(address);
+
+      // ── Calculate road route ──────────────────────────────────────────
+      if (checkInRecord) {
+        const result = await getRoadRoute(
+          checkInRecord.coords.latitude,
+          checkInRecord.coords.longitude,
+          coords.latitude,
+          coords.longitude,
+        );
+
+        if (result) {
+          const distKm = Number(result.distanceKm.toFixed(2));
+          const totalMins = Math.round(result.durationMin);
+          const hours = Math.floor(totalMins / 60);
+          const minutes = totalMins % 60;
+
+          setSessionStats({ hours, minutes, distanceKm: distKm });
+
+          // Decode polyline for the map
+          const decoded = polyline.decode(result.geometry);
+          setRouteCoords(decoded.map(p => ({ latitude: p[0], longitude: p[1] })));
+
+          Alert.alert(
+            'Checked Out ✅',
+            `📍 ${address}\n\n🛣 Distance: ${distKm} km\n⏱ Duration: ${hours}h ${minutes}m`,
+          );
+        } else {
+          Alert.alert('Checked Out', `📍 ${address}\n(Route data unavailable)`);
+        }
+      }
+    } catch (err: any) {
+      Alert.alert('Error', err.message ?? 'Failed to check out. Try again.');
+    } finally {
+      setLoading(false);
+      setStatusText('');
+    }
+  };
+
+  // ── Map region ────────────────────────────────────────────────────────
+  const mapCenter = checkInRecord?.coords ?? { latitude: 20.5937, longitude: 78.9629 };
 
   return (
     <ScrollView
-      contentContainerStyle={{
-        flexGrow: 1,
-        paddingBottom: 40,
-      }}
-      showsVerticalScrollIndicator={false}
-      keyboardShouldPersistTaps="handled">
-      <View style={styles.container}>
-        <View style={styles.header}>
-          <Text style={styles.headerTitle}>Check In</Text>
+      contentContainerStyle={{ flexGrow: 1, paddingBottom: 40 }}
+      showsVerticalScrollIndicator={false}>
+
+      {/* ── Header ── */}
+      <View style={s.header}>
+        <Text style={s.headerTitle}>Check In</Text>
+      </View>
+
+      <View style={s.card}>
+
+        {/* Welcome */}
+        <View style={s.welcomeRow}>
+          <Text style={s.welcomeName}>Welcome, {userName}!</Text>
+          <Text style={s.welcomeRole}>Sales Officer</Text>
         </View>
 
-        <View style={styles.card}>
-          <View style={styles.welcomeRow}>
-            <View>
-              <Text style={styles.welcome}>Welcome, {userName}!</Text>
-              <Text style={styles.subText}>Sales Officer</Text>
-            </View>
-          </View>
+        {/* ── Map ── */}
+        {checkInRecord && (
+          <MapView
+            style={s.map}
+            region={{
+              latitude: mapCenter.latitude,
+              longitude: mapCenter.longitude,
+              latitudeDelta: 0.05,
+              longitudeDelta: 0.05,
+            }}>
 
-          {/* <Image source={CheckIn} style={styles.map} /> */}
-          {lastCheckIn && (
-            <MapView
-              style={{ height: 250, marginVertical: 12 }}
-              initialRegion={{
-                latitude: lastCheckIn.coords.latitude,
-                longitude: lastCheckIn.coords.longitude,
-                latitudeDelta: 0.05,
-                longitudeDelta: 0.05,
-              }}>
-              {/* Start Marker */}
+            {/* Check-in marker (green) */}
+            <Marker
+              coordinate={checkInRecord.coords}
+              title="Check-in"
+              description={new Date(checkInRecord.timestamp).toLocaleTimeString('en-IN')}
+              pinColor="green"
+            />
+
+            {/* Live track points (blue dots) */}
+            {trackPoints.map((pt, i) => (
+              <Marker key={`t${i}`} coordinate={pt} pinColor="blue" opacity={0.7} />
+            ))}
+
+            {/* Check-out marker (red) */}
+            {checkOutRecord && (
               <Marker
-                coordinate={{
-                  latitude: lastCheckIn.coords.latitude,
-                  longitude: lastCheckIn.coords.longitude,
-                }}
-                title="Start"
-                pinColor="green"
+                coordinate={checkOutRecord.coords}
+                title="Check-out"
+                description={new Date(checkOutRecord.timestamp).toLocaleTimeString('en-IN')}
+                pinColor="red"
               />
+            )}
 
-              {/* Track Points */}
-              {trackPoints.map((point, index) => (
-                <Marker
-                  key={index}
-                  coordinate={{
-                    latitude: point.coords.latitude,
-                    longitude: point.coords.longitude,
-                  }}
-                  pinColor="blue"
-                />
-              ))}
+            {/* Road route polyline */}
+            {routeCoords.length > 0 && (
+              <Polyline
+                coordinates={routeCoords}
+                strokeColor="#2563eb"
+                strokeWidth={4}
+              />
+            )}
+          </MapView>
+        )}
 
-              {/* Polyline */}
-              {routePolyline.length > 0 && (
-                <Polyline
-                  coordinates={routePolyline}
-                  strokeWidth={4}
-                  strokeColor="blue"
-                />
-              )}
-            </MapView>
-          )}
-
-          <View style={styles.locationRow}>
-            <Text style={styles.locationText}>Location</Text>
-            <Text style={styles.dayText}>{displayAddress}</Text>
-          </View>
-
-          {/* Records + Stats Section */}
-          {lastCheckIn ? (
-            <>
-              {/* Check-in Card */}
-              <View
-                style={{
-                  marginVertical: 12,
-                  padding: 12,
-                  backgroundColor: '#f0fdf4',
-                  borderRadius: 8,
-                  borderWidth: 1,
-                  borderColor: '#86efac',
-                }}>
-                <Text style={{ fontWeight: 'bold', color: '#15803d' }}>
-                  Checked In
-                </Text>
-                <Text style={{ color: '#4b5563', marginTop: 4, fontSize: 13 }}>
-                  {new Date(lastCheckIn.timestamp).toLocaleString('en-IN')}
-                </Text>
-                <Text style={{ marginTop: 6, color: '#374151' }}>
-                  📍 {lastCheckIn.address || 'Location not available'}
-                </Text>
-              </View>
-
-              {/* Check-out Card + Session Stats */}
-              {lastCheckOut && (
-                <View
-                  style={{
-                    marginVertical: 12,
-                    padding: 12,
-                    backgroundColor: '#fef2f2',
-                    borderRadius: 8,
-                    borderWidth: 1,
-                    borderColor: '#fca5a5',
-                  }}>
-                  <Text
-                    style={{
-                      fontWeight: 'bold',
-                      color: '#b91c1c',
-                      fontSize: 16,
-                    }}>
-                    Checked Out
-                  </Text>
-                  <Text style={{ color: '#4b5563', marginTop: 4, fontSize: 13 }}>
-                    {new Date(lastCheckOut.timestamp).toLocaleString('en-IN')}
-                  </Text>
-                  <Text style={{ marginTop: 6, color: '#374151' }}>
-                    📍 {lastCheckOut.address || 'Location not available'}
-                  </Text>
-                </View>
-              )}
-              {sessionStats && (
-                <View
-                  style={{
-                    marginVertical: 12,
-                    padding: 12,
-                    backgroundColor: '#baddf2',
-                    borderRadius: 8,
-                    borderWidth: 1,
-                    borderColor: '#87cbf5',
-                  }}>
-                  <Text
-                    style={{ color: '#1b3a99', fontWeight: '600', fontSize: 15 }}>
-                    Session Summary
-                  </Text>
-                  {sessionStats && (
-                    <View>
-                      <Text>
-                        ⏱ Duration: {sessionStats.hours} hrs {sessionStats.minutes} min
-                      </Text>
-
-                      <Text>
-                        🛣 Total Distance: {sessionStats.distanceKm.toFixed(2)} km
-                      </Text>
-                    </View>
-                  )}
-
-                  {/* View Route Map Button */}
-                  {/* <TouchableOpacity
-                    style={{
-                      marginTop: 12,
-                      paddingVertical: 10,
-                      paddingHorizontal: 12,
-                      backgroundColor: '#0ea5e9',
-                      borderRadius: 6,
-                      justifyContent: 'center',
-                      alignItems: 'center',
-                    }}
-                    onPress={() => {
-                      navigation.navigate('Tracking', {
-                        checkInRecord: lastCheckIn,
-                        trackPoints,
-                        sessionStats,
-                      });
-                    }}>
-                    <Text
-                      style={{color: '#fff', fontWeight: '600', fontSize: 14}}>
-                      🗺 View Route Map
-                    </Text>
-                  </TouchableOpacity> */}
-                </View>
-              )}
-            </>
-          ) : (
-            <Text
-              style={{
-                textAlign: 'center',
-                color: '#6b7280',
-                marginVertical: 16,
-              }}>
-              No Check-in yet
-            </Text>
-          )}
-
-          {/* Action Button */}
-          <TouchableOpacity
-            style={[
-              styles.checkInBtn,
-              nextAction === 'check-out' && { backgroundColor: '#b91c1c' },
-            ]}
-            onPress={() => handleAction(nextAction)}
-            disabled={loading}>
-            <Text style={styles.checkInText}>{buttonText}</Text>
-          </TouchableOpacity>
-
-          <Text style={styles.signalText}>
-            {loading
-              ? 'Getting location...'
-              : isLastCheckIn
-                ? 'Tracking active...'
-                : ''}
-          </Text>
+        {/* ── Location label ── */}
+        <View style={s.locationRow}>
+          <Text style={s.locationLabel}>📍 Current Location</Text>
+          <Text style={s.locationValue}>{displayAddress}</Text>
         </View>
+
+        {/* ── Check-in info card ── */}
+        {checkInRecord && (
+          <View style={[s.infoCard, s.infoCardGreen]}>
+            <Text style={[s.infoCardTitle, { color: '#15803d' }]}>✅ Checked In</Text>
+            <Text style={s.infoCardTime}>
+              {new Date(checkInRecord.timestamp).toLocaleString('en-IN')}
+            </Text>
+            <Text style={s.infoCardAddr}>📍 {checkInRecord.address}</Text>
+          </View>
+        )}
+
+        {/* ── Check-out info card ── */}
+        {checkOutRecord && (
+          <View style={[s.infoCard, s.infoCardRed]}>
+            <Text style={[s.infoCardTitle, { color: '#b91c1c' }]}>🔴 Checked Out</Text>
+            <Text style={s.infoCardTime}>
+              {new Date(checkOutRecord.timestamp).toLocaleString('en-IN')}
+            </Text>
+            <Text style={s.infoCardAddr}>📍 {checkOutRecord.address}</Text>
+          </View>
+        )}
+
+        {/* ── Session summary ── */}
+        {sessionStats && (
+          <View style={[s.infoCard, s.infoCardBlue]}>
+            <Text style={[s.infoCardTitle, { color: '#1d4ed8' }]}>📊 Session Summary</Text>
+            <Text style={s.statRow}>
+              ⏱  Duration:   {sessionStats.hours}h {sessionStats.minutes}m
+            </Text>
+            <Text style={s.statRow}>
+              🛣  Distance:   {sessionStats.distanceKm.toFixed(2)} km
+            </Text>
+          </View>
+        )}
+
+        {!checkInRecord && (
+          <Text style={s.noCheckin}>No check-in yet. Tap CHECK-IN below.</Text>
+        )}
+
+        {/* ── Action button ── */}
+        <TouchableOpacity
+          style={[s.actionBtn, isCheckedIn && s.actionBtnRed]}
+          onPress={isCheckedIn ? handleCheckOut : handleCheckIn}
+          disabled={loading}>
+          {loading
+            ? <ActivityIndicator color="#fff" />
+            : <Text style={s.actionBtnText}>{isCheckedIn ? 'CHECK-OUT' : 'CHECK-IN'}</Text>
+          }
+        </TouchableOpacity>
+
+        {/* Status text */}
+        {!!statusText && <Text style={s.statusText}>{statusText}</Text>}
+        {isCheckedIn && !loading && (
+          <Text style={s.trackingBadge}>🟢 Tracking active — location updates every 20 m</Text>
+        )}
+
       </View>
     </ScrollView>
   );
 };
+
+const s = StyleSheet.create({
+  // 🔷 Header (improved)
+  header: {
+    // backgroundColor: '#fff',
+    paddingHorizontal: 20,
+    paddingVertical: 18,
+    // borderBottomLeftRadius: 16,
+    // borderBottomRightRadius: 16,
+    elevation: 6,
+  },
+  headerTitle: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#ffffff',
+    textAlign: 'center',
+    letterSpacing: 0.5,
+  },
+
+  // 🔷 Main Card
+  card: {
+    margin: 16,
+    marginTop: -20, // overlap effect with header
+    backgroundColor: '#ffffff',
+    borderRadius: 16,
+    padding: 16,
+    elevation: 5,
+  },
+
+  // 🔷 Welcome
+  welcomeRow: {
+    marginBottom: 16,
+  },
+  welcomeName: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#111827',
+  },
+  welcomeRole: {
+    fontSize: 13,
+    color: '#6b7280',
+    marginTop: 4,
+  },
+
+  // 🔷 Map
+  map: {
+    height: 260,
+    borderRadius: 14,
+    marginBottom: 16,
+    overflow: 'hidden',
+  },
+
+  // 🔷 Location
+  locationRow: {
+    marginBottom: 14,
+  },
+  locationLabel: {
+    fontSize: 12,
+    color: '#9ca3af',
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  locationValue: {
+    fontSize: 14,
+    color: '#374151',
+    fontWeight: '500',
+  },
+
+  // 🔷 Info Cards
+  infoCard: {
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 12,
+    borderWidth: 1,
+  },
+  infoCardGreen: {
+    backgroundColor: '#ecfdf5',
+    borderColor: '#4ade80',
+  },
+  infoCardRed: {
+    backgroundColor: '#fef2f2',
+    borderColor: '#f87171',
+  },
+  infoCardBlue: {
+    backgroundColor: '#eff6ff',
+    borderColor: '#60a5fa',
+  },
+
+  infoCardTitle: {
+    fontWeight: '700',
+    fontSize: 15,
+    marginBottom: 6,
+  },
+  infoCardTime: {
+    fontSize: 12,
+    color: '#6b7280',
+    marginBottom: 4,
+  },
+  infoCardAddr: {
+    fontSize: 13,
+    color: '#374151',
+  },
+
+  // 🔷 Stats
+  statRow: {
+    fontSize: 14,
+    color: '#1d4ed8',
+    marginTop: 4,
+    fontWeight: '500',
+  },
+
+  // 🔷 Empty text
+  noCheckin: {
+    textAlign: 'center',
+    color: '#9ca3af',
+    marginVertical: 16,
+    fontSize: 14,
+  },
+
+  // 🔷 Button (modern)
+  actionBtn: {
+    backgroundColor: '#2563eb',
+    borderRadius: 10,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginTop: 10,
+    elevation: 3,
+  },
+  actionBtnRed: {
+    backgroundColor: '#dc2626',
+  },
+  actionBtnText: {
+    color: '#ffffff',
+    fontWeight: '700',
+    fontSize: 16,
+    letterSpacing: 1,
+  },
+
+  // 🔷 Status
+  statusText: {
+    textAlign: 'center',
+    color: '#6b7280',
+    fontSize: 13,
+    marginTop: 10,
+  },
+
+  // 🔷 Tracking badge
+  trackingBadge: {
+    textAlign: 'center',
+    color: '#16a34a',
+    fontSize: 12,
+    marginTop: 6,
+    fontWeight: '600',
+  },
+});
 
 export default Checkin;

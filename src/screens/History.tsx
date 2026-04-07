@@ -1,371 +1,364 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback } from 'react';
 import {
   View,
   Text,
-  TouchableOpacity,
   FlatList,
   StyleSheet,
-  Alert,
   SafeAreaView,
   ActivityIndicator,
   Dimensions,
+  TouchableOpacity,
+  Alert,
 } from 'react-native';
-
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from '@react-navigation/native';
-
 import MapView, { Polyline, Marker } from 'react-native-maps';
 import polyline from '@mapbox/polyline';
 
 import { getRoadRoute } from '../helpers/locationHelper';
+import { calculateTimeDifference, calculateTotalDistance } from '../helpers/calculateKm';
 
-import {
-  calculateTimeDifference,
-  calculateTotalDistance,
-} from '../helpers/calculateKm';
+// ─── Types ────────────────────────────────────────────────────────────────
+interface Coords { latitude: number; longitude: number; }
 
 interface CheckRecord {
   type: 'check-in' | 'check-out' | 'track';
   timestamp: string;
   address?: string;
-  coords: {
-    latitude: number;
-    longitude: number;
-  };
+  coords: Coords;
 }
 
-interface SessionRecord {
+interface Session {
   id: string;
   checkIn: CheckRecord;
   checkOut?: CheckRecord;
   trackPoints: CheckRecord[];
-  sessionStats?: {
-    hours: number;
-    minutes: number;
-    distanceKm: number;
-  };
-  routePolyline?: { latitude: number; longitude: number }[];
-  savedAt: string;
+  stats: { hours: number; minutes: number; distanceKm: number };
+  routePolyline: Coords[];
 }
 
-const CHECKIN_HISTORY_KEY = '@checkin_history';
+const HISTORY_KEY = '@checkin_history';
 
+// ─── Group flat history into sessions ────────────────────────────────────
+const buildSessions = async (history: CheckRecord[]): Promise<Session[]> => {
+  const sessions: Session[] = [];
+  let current: Session | null = null;
+
+  for (let i = 0; i < history.length; i++) {
+    const rec = history[i];
+
+    if (rec.type === 'check-in') {
+      if (current) sessions.push(current);
+      current = {
+        id: `${rec.timestamp}-${i}`,
+        checkIn: rec,
+        checkOut: undefined,
+        trackPoints: [],
+        stats: { hours: 0, minutes: 0, distanceKm: 0 },
+        routePolyline: [],
+      };
+    } else if (rec.type === 'track' && current) {
+      current.trackPoints.push(rec);
+    } else if (rec.type === 'check-out' && current) {
+      current.checkOut = rec;
+
+      // ── Calculate time ──────────────────────────────────────────────
+      const dur = calculateTimeDifference(current.checkIn.timestamp, rec.timestamp);
+      current.stats.hours = dur.hours;
+      current.stats.minutes = dur.minutes;
+
+      // ── Try OSRM road route first ───────────────────────────────────
+      try {
+        const road = await getRoadRoute(
+          current.checkIn.coords.latitude,
+          current.checkIn.coords.longitude,
+          rec.coords.latitude,
+          rec.coords.longitude,
+        );
+
+        if (road) {
+          current.stats.distanceKm = Number(road.distanceKm.toFixed(2));
+          const decoded = polyline.decode(road.geometry);
+          current.routePolyline = decoded.map(p => ({ latitude: p[0], longitude: p[1] }));
+        } else {
+          // Fallback: straight-line via track points
+          const pts = [
+            current.checkIn.coords,
+            ...current.trackPoints.map(p => p.coords),
+            rec.coords,
+          ];
+          current.stats.distanceKm = calculateTotalDistance(pts);
+          current.routePolyline = pts;
+        }
+      } catch (e) {
+        console.log('Route error in history:', e);
+      }
+
+      sessions.push(current);
+      current = null;
+    }
+  }
+
+  // Incomplete session (no check-out yet)
+  if (current) sessions.push(current);
+
+  return sessions;
+};
+
+// ─── Component ────────────────────────────────────────────────────────────
 const History = () => {
-  const [sessions, setSessions] = useState<SessionRecord[]>([]);
+  const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  // 🔍 Debug history (runs once)
-  useEffect(() => {
-    const checkHistory = async () => {
-      try {
-        const value = await AsyncStorage.getItem(CHECKIN_HISTORY_KEY);
-        console.log('Check-in History:', value);
-      } catch (e) {
-        console.log('Error reading history:', e);
-      }
-    };
-
-    checkHistory();
-  }, []);
-
   useFocusEffect(
     useCallback(() => {
-      loadCheckinHistory();
+      load();
     }, []),
   );
 
-  const loadCheckinHistory = async () => {
+  const load = async () => {
     try {
       setLoading(true);
-
-      const json = await AsyncStorage.getItem(CHECKIN_HISTORY_KEY);
-
-      if (json) {
-        const history: CheckRecord[] = JSON.parse(json);
-
-        const groupedSessions = await groupIntoSessions(history);
-
-        setSessions(groupedSessions.reverse());
+      const raw = await AsyncStorage.getItem(HISTORY_KEY);
+      if (raw) {
+        const history: CheckRecord[] = JSON.parse(raw);
+        const built = await buildSessions(history);
+        setSessions(built.reverse()); // newest first
       } else {
         setSessions([]);
       }
     } catch (err) {
-      console.error('Failed to load history:', err);
+      console.error('History load error:', err);
       Alert.alert('Error', 'Failed to load history');
     } finally {
       setLoading(false);
     }
   };
 
-  const groupIntoSessions = async (
-    history: CheckRecord[],
-  ): Promise<SessionRecord[]> => {
-    const sessions: SessionRecord[] = [];
-    let currentSession: SessionRecord | null = null;
-
-    for (let i = 0; i < history.length; i++) {
-      const record = history[i];
-
-      if (record.type === 'check-in') {
-        if (currentSession) sessions.push(currentSession);
-
-        currentSession = {
-          id: `${record.timestamp}-${i}`,
-          checkIn: record,
-          trackPoints: [],
-          savedAt: record.timestamp,
-        };
-      }
-
-      else if (record.type === 'track' && currentSession) {
-        currentSession.trackPoints.push(record);
-      }
-
-      else if (record.type === 'check-out' && currentSession) {
-
-        currentSession.checkOut = record;
-        currentSession.savedAt = record.timestamp;
-
-        const duration = calculateTimeDifference(
-          currentSession.checkIn.timestamp,
-          record.timestamp
-        );
-
-        currentSession.sessionStats = {
-          hours: duration.hours,
-          minutes: duration.minutes,
-          distanceKm: 0,
-        };
-
-        // 🛣 road route
-        try {
-
-          const roadResult = await getRoadRoute(
-            currentSession.checkIn.coords.latitude,
-            currentSession.checkIn.coords.longitude,
-            record.coords.latitude,
-            record.coords.longitude
-          );
-
-          if (roadResult) {
-
-            currentSession.sessionStats.distanceKm =
-              Number(roadResult.distanceKm.toFixed(2));
-
-            const decoded = polyline.decode(roadResult.geometry);
-
-            currentSession.routePolyline = decoded.map(p => ({
-              latitude: p[0],
-              longitude: p[1],
-            }));
-
-          } else {
-
-            const allPoints = [
-              currentSession.checkIn.coords,
-              ...currentSession.trackPoints.map(p => p.coords),
-              record.coords,
-            ];
-
-            currentSession.sessionStats.distanceKm =
-              calculateTotalDistance(allPoints);
-
-          }
-
-        } catch (err) {
-          console.log('Route calculation error:', err);
-        }
-
-        sessions.push(currentSession);
-        currentSession = null;
-      }
-    }
-
-    if (currentSession) {
-      sessions.push(currentSession);
-    }
-
-    return sessions;
+  const clearHistory = () => {
+    Alert.alert('Clear History', 'Delete all location history?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          await AsyncStorage.removeItem(HISTORY_KEY);
+          setSessions([]);
+        },
+      },
+    ]);
   };
 
-  const renderSessionItem = ({ item }: { item: SessionRecord }) => {
-
-    const isExpanded = expandedId === item.id;
-    const stats = item.sessionStats || { hours: 0, minutes: 0, distanceKm: 0 };
+  // ── Session card ────────────────────────────────────────────────────
+  const renderItem = ({ item }: { item: Session }) => {
+    const expanded = expandedId === item.id;
+    const hasCheckOut = !!item.checkOut;
 
     return (
-      <View style={styles.sessionCard}>
-
+      <View style={s.card}>
         <TouchableOpacity
-          onPress={() => setExpandedId(isExpanded ? null : item.id)}
-          style={styles.sessionHeader}>
+          onPress={() => setExpandedId(expanded ? null : item.id)}
+          style={s.cardHeader}
+          activeOpacity={0.7}>
 
-          <View>
-            <Text style={styles.sessionDate}>
-              📅 {new Date(item.checkIn.timestamp).toLocaleDateString('en-IN')}
+          <View style={{ flex: 1 }}>
+            <Text style={s.dateText}>
+              📅 {new Date(item.checkIn.timestamp).toLocaleDateString('en-IN', {
+                day: '2-digit', month: 'short', year: 'numeric',
+              })}
             </Text>
-
-            <Text style={styles.sessionTime}>
-              ⏰ {new Date(item.checkIn.timestamp).toLocaleTimeString('en-IN')}
+            <Text style={s.timeText}>
+              🕐 {new Date(item.checkIn.timestamp).toLocaleTimeString('en-IN')}
+              {hasCheckOut
+                ? ` → ${new Date(item.checkOut!.timestamp).toLocaleTimeString('en-IN')}`
+                : ' (ongoing)'}
             </Text>
+            {item.checkIn.address ? (
+              <Text style={s.addrText} numberOfLines={1}>📍 {item.checkIn.address}</Text>
+            ) : null}
           </View>
 
-          <View>
-            <Text style={styles.statText}>
-              📍 {stats.distanceKm.toFixed(2)} km
+          <View style={{ alignItems: 'flex-end', marginLeft: 8 }}>
+            <Text style={s.statBadge}>
+              {item.stats.distanceKm.toFixed(2)} km
             </Text>
-
-            <Text style={styles.statText}>
-              ⏱ {stats.hours}h {stats.minutes}m
+            <Text style={s.statBadge}>
+              {item.stats.hours}h {item.stats.minutes}m
             </Text>
+            {!hasCheckOut && (
+              <View style={s.liveDot}>
+                <Text style={s.liveText}>● LIVE</Text>
+              </View>
+            )}
           </View>
-
         </TouchableOpacity>
 
-        {isExpanded && (
-          <View style={styles.mapContainer}>
-
+        {/* ── Expanded: map ── */}
+        {expanded && (
+          <View style={s.mapWrap}>
             <MapView
-              style={styles.map}
+              style={s.map}
               initialRegion={{
                 latitude: item.checkIn.coords.latitude,
                 longitude: item.checkIn.coords.longitude,
-                latitudeDelta: 0.05,
-                longitudeDelta: 0.05,
+                latitudeDelta: 0.06,
+                longitudeDelta: 0.06,
               }}>
 
-              <Marker coordinate={item.checkIn.coords} pinColor="green" />
+              {/* Check-in: green */}
+              <Marker
+                coordinate={item.checkIn.coords}
+                title="Check-in"
+                description={new Date(item.checkIn.timestamp).toLocaleTimeString('en-IN')}
+                pinColor="green"
+              />
 
+              {/* Track points: blue */}
               {item.trackPoints.map((p, i) => (
-                <Marker key={i} coordinate={p.coords} pinColor="blue" />
+                <Marker key={`tp${i}`} coordinate={p.coords} pinColor="blue" opacity={0.6} />
               ))}
 
+              {/* Check-out: red */}
               {item.checkOut && (
-                <Marker coordinate={item.checkOut.coords} pinColor="red" />
-              )}
-
-              {item.routePolyline && (
-                <Polyline
-                  coordinates={item.routePolyline}
-                  strokeWidth={4}
-                  strokeColor="#3b82f6"
+                <Marker
+                  coordinate={item.checkOut.coords}
+                  title="Check-out"
+                  description={new Date(item.checkOut.timestamp).toLocaleTimeString('en-IN')}
+                  pinColor="red"
                 />
               )}
 
+              {/* Road route polyline */}
+              {item.routePolyline.length > 1 && (
+                <Polyline
+                  coordinates={item.routePolyline}
+                  strokeColor="#2563eb"
+                  strokeWidth={4}
+                />
+              )}
             </MapView>
 
+            {/* Stats overlay */}
+            <View style={s.statsRow}>
+              <Text style={s.statItem}>🛣 {item.stats.distanceKm.toFixed(2)} km</Text>
+              <Text style={s.statItem}>⏱ {item.stats.hours}h {item.stats.minutes}m</Text>
+              {item.checkOut && (
+                <Text style={s.statItem}>
+                  📍 {item.checkOut.address ?? 'Checkout location'}
+                </Text>
+              )}
+            </View>
           </View>
         )}
       </View>
     );
   };
 
+  // ── Render ─────────────────────────────────────────────────────────
   if (loading) {
     return (
-      <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#3b82f6" />
+      <View style={s.center}>
+        <ActivityIndicator size="large" color="#2563eb" />
+        <Text style={{ marginTop: 10, color: '#6b7280' }}>Loading history…</Text>
       </View>
     );
   }
 
   return (
-    <SafeAreaView style={styles.container}>
-
-      <View style={styles.header}>
-        <Text style={styles.headerTitle}>Check-in History</Text>
+    <SafeAreaView style={s.root}>
+      <View style={s.header}>
+        <Text style={s.headerTitle}>Location History</Text>
+        {sessions.length > 0 && (
+          <TouchableOpacity onPress={clearHistory} style={s.clearBtn}>
+            <Text style={s.clearBtnText}>Clear All</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       {sessions.length === 0 ? (
-
-        <View style={styles.emptyState}>
-          <Text style={{ fontSize: 40 }}>📍</Text>
-          <Text>No history yet</Text>
+        <View style={s.center}>
+          <Text style={{ fontSize: 48 }}>📍</Text>
+          <Text style={{ color: '#6b7280', marginTop: 8 }}>No check-in history yet</Text>
         </View>
-
       ) : (
-
         <FlatList
           data={sessions}
-          renderItem={renderSessionItem}
+          renderItem={renderItem}
           keyExtractor={item => item.id}
+          contentContainerStyle={{ paddingBottom: 30 }}
         />
-
       )}
-
     </SafeAreaView>
   );
 };
 
 const { height } = Dimensions.get('window');
 
-const styles = StyleSheet.create({
+const s = StyleSheet.create({
+  root: {
+    flex: 1, backgroundColor: '#f3f4f6',
+  },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
 
-container:{backgroundColor:'#f9fafb'},
+  header: {
+    flexDirection: 'row',
 
-header:{
-// padding:16,
-backgroundColor:'#fff',
-// borderBottomWidth:1,
-borderColor:'#e5e7eb'
-},
+    marginTop: '10%',
 
-headerTitle:{
-fontSize:18,
-fontWeight:'700'
-},
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e5e7eb',
+  },
+  headerTitle: { fontSize: 18, fontWeight: '700', color: '#111827' },
+  clearBtn: { paddingVertical: 6, paddingHorizontal: 12, backgroundColor: '#fee2e2', borderRadius: 6 },
+  clearBtnText: { color: '#dc2626', fontWeight: '600', fontSize: 13 },
 
-sessionCard:{
-margin:10,
-backgroundColor:'#fff',
-borderRadius:8,
-overflow:'hidden',
-borderWidth:1,
-borderColor:'#e5e7eb'
-},
+  card: {
+    marginHorizontal: 12,
+    backgroundColor: '#fff',
+    borderRadius: 10,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.06,
+    shadowRadius: 4,
+  },
 
-sessionHeader:{
-flexDirection:'row',
-justifyContent:'space-between',
-padding:16,
-backgroundColor:'#f3f4f6'
-},
+  cardHeader: {
+    flexDirection: 'row',
+    padding: 14,
+    backgroundColor: '#f9fafb',
+    alignItems: 'center',
+  },
+  dateText: { fontSize: 14, fontWeight: '700', color: '#111827' },
+  timeText: { fontSize: 12, color: '#6b7280', marginTop: 2 },
+  addrText: { fontSize: 12, color: '#374151', marginTop: 3 },
 
-sessionDate:{
-fontSize:14,
-fontWeight:'600'
-},
+  statBadge: { fontSize: 13, fontWeight: '600', color: '#1d4ed8', marginBottom: 2 },
+  liveDot: { backgroundColor: '#dcfce7', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, marginTop: 2 },
+  liveText: { fontSize: 11, color: '#15803d', fontWeight: '700' },
 
-sessionTime:{
-fontSize:12,
-color:'#6b7280'
-},
+  mapWrap: { borderTopWidth: 1, borderTopColor: '#e5e7eb' },
+  map: { height: height * 0.32 },
 
-statText:{
-fontSize:13,
-fontWeight:'600'
-},
-
-mapContainer:{
-height:height*0.3
-},
-
-map:{
-flex:1
-},
-
-loadingContainer:{
-flex:1,
-justifyContent:'center',
-alignItems:'center'
-},
-
-emptyState:{
-flex:1,
-justifyContent:'center',
-alignItems:'center'
-}
-
+  statsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    padding: 10,
+    gap: 6,
+    backgroundColor: '#f0f9ff',
+    borderTopWidth: 1,
+    borderTopColor: '#bae6fd',
+  },
+  statItem: { fontSize: 12, color: '#0369a1', marginRight: 10 },
 });
 
 export default History;

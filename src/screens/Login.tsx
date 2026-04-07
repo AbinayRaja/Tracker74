@@ -15,19 +15,19 @@ const Login = () => {
   const [name, setName] = useState('');
   const navigation = useNavigation<NativeStackNavigationProp<any>>();
 
-const handleContinue = () => {
-  if (!name.trim()) {
-    Alert.alert('Please enter your name');
-    return;
-  }
+  const handleContinue = () => {
+    if (!name.trim()) {
+      Alert.alert('Please enter your name');
+      return;
+    }
 
-  console.log('User Name:', name);
+    console.log('User Name:', name);
 
-  navigation.replace('Home', {
-    screen: 'Checkin',
-    params: { userName: name },
-  });
-};
+    navigation.replace('Home', {
+      screen: 'Checkin',
+      params: { userName: name },
+    });
+  };
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Welcome 👋</Text>
