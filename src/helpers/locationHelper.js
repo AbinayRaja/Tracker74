@@ -88,34 +88,56 @@ export const getRoadRoute = async (originLat, originLng, destLat, destLng) => {
   }
 };
 
-// ─── Continuous background tracking ──────────────────────────────────────
-let _trackingWatchId = null;
+// ─── Continuous background tracking (20 minutes interval) ────────────────
+// FIX: Changed from distance-based (20m) to time-based (20 min = 1200000ms)
+// This ensures location is saved every 20 minutes as required.
 
-export const startTracking = (onNewLocation, intervalMs = 30000) => {
+let _trackingWatchId = null;
+let _intervalTimer = null;
+
+export const startTracking = (onNewLocation, intervalMs = 20 * 60 * 1000) => {
+  // Clear any existing tracking
   if (_trackingWatchId !== null) {
     Geolocation.clearWatch(_trackingWatchId);
     _trackingWatchId = null;
   }
+  if (_intervalTimer !== null) {
+    clearInterval(_intervalTimer);
+    _intervalTimer = null;
+  }
 
-  _trackingWatchId = Geolocation.watchPosition(
-    position => {
-      onNewLocation(position.coords, new Date().toISOString());
-    },
-    error => {
-      console.log('Tracking error:', error.message);
-    },
-    {
-      enableHighAccuracy: true,
-      distanceFilter: 20,
-      interval: intervalMs,
-      fastestInterval: 10000,
-    },
-  );
+  // Helper to fetch and emit a location point
+  const captureLocation = () => {
+    Geolocation.getCurrentPosition(
+      position => {
+        onNewLocation(position.coords, new Date().toISOString());
+      },
+      error => {
+        console.log('Tracking capture error:', error.message);
+        // Fallback to lower accuracy
+        Geolocation.getCurrentPosition(
+          pos => onNewLocation(pos.coords, new Date().toISOString()),
+          err => console.log('Tracking fallback error:', err.message),
+          { enableHighAccuracy: false, timeout: 20000, maximumAge: 30000 },
+        );
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 },
+    );
+  };
 
+  // Capture immediately on start, then every intervalMs (20 min)
+  captureLocation();
+  _intervalTimer = setInterval(captureLocation, intervalMs);
+
+  // Return stop function
   return () => {
     if (_trackingWatchId !== null) {
       Geolocation.clearWatch(_trackingWatchId);
       _trackingWatchId = null;
+    }
+    if (_intervalTimer !== null) {
+      clearInterval(_intervalTimer);
+      _intervalTimer = null;
     }
   };
 };
@@ -124,5 +146,9 @@ export const stopTracking = () => {
   if (_trackingWatchId !== null) {
     Geolocation.clearWatch(_trackingWatchId);
     _trackingWatchId = null;
+  }
+  if (_intervalTimer !== null) {
+    clearInterval(_intervalTimer);
+    _intervalTimer = null;
   }
 };

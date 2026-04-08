@@ -15,7 +15,6 @@ import { useFocusEffect } from '@react-navigation/native';
 import MapView, { Polyline, Marker } from 'react-native-maps';
 import polyline from '@mapbox/polyline';
 
-import { getRoadRoute } from '../helpers/locationHelper';
 import { calculateTimeDifference, calculateTotalDistance } from '../helpers/calculateKm';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -38,6 +37,43 @@ interface Session {
 }
 
 const HISTORY_KEY = '@checkin_history';
+
+// ─── Build OSRM route through all waypoints ───────────────────────────────
+const buildOsrmRoute = async (waypoints: Coords[]): Promise<{ distanceKm: number; coords: Coords[] } | null> => {
+  if (waypoints.length < 2) return null;
+
+  // Deduplicate consecutive identical coords
+  const unique = waypoints.filter((pt, i) => {
+    if (i === 0) return true;
+    const prev = waypoints[i - 1];
+    return !(Math.abs(pt.latitude - prev.latitude) < 0.0001 &&
+      Math.abs(pt.longitude - prev.longitude) < 0.0001);
+  });
+
+  if (unique.length < 2) return null;
+
+  try {
+    const waypointStr = unique.map(p => `${p.longitude},${p.latitude}`).join(';');
+    const url =
+      `https://router.project-osrm.org/route/v1/driving/${waypointStr}` +
+      `?overview=full&geometries=polyline`;
+
+    const response = await fetch(url);
+    const json = await response.json();
+
+    if (!json.routes || json.routes.length === 0) return null;
+
+    const route = json.routes[0];
+    const distanceKm = Number((route.distance / 1000).toFixed(2));
+    const decoded = polyline.decode(route.geometry);
+    const coords: Coords[] = decoded.map((p: number[]) => ({ latitude: p[0], longitude: p[1] }));
+
+    return { distanceKm, coords };
+  } catch (e) {
+    console.log('OSRM multi-waypoint error:', e);
+    return null;
+  }
+};
 
 // ─── Group flat history into sessions ────────────────────────────────────
 const buildSessions = async (history: CheckRecord[]): Promise<Session[]> => {
@@ -62,36 +98,33 @@ const buildSessions = async (history: CheckRecord[]): Promise<Session[]> => {
     } else if (rec.type === 'check-out' && current) {
       current.checkOut = rec;
 
-      // ── Calculate time ──────────────────────────────────────────────
+      // FIX: Actual time from check-in timestamp to check-out timestamp
       const dur = calculateTimeDifference(current.checkIn.timestamp, rec.timestamp);
       current.stats.hours = dur.hours;
       current.stats.minutes = dur.minutes;
 
-      // ── Try OSRM road route first ───────────────────────────────────
-      try {
-        const road = await getRoadRoute(
-          current.checkIn.coords.latitude,
-          current.checkIn.coords.longitude,
-          rec.coords.latitude,
-          rec.coords.longitude,
-        );
+      // FIX: Build full route: checkIn → all trackPoints → checkOut via OSRM
+      const allWaypoints: Coords[] = [
+        current.checkIn.coords,
+        ...current.trackPoints.map(tp => tp.coords),
+        rec.coords,
+      ];
 
-        if (road) {
-          current.stats.distanceKm = Number(road.distanceKm.toFixed(2));
-          const decoded = polyline.decode(road.geometry);
-          current.routePolyline = decoded.map(p => ({ latitude: p[0], longitude: p[1] }));
+      try {
+        const osrmResult = await buildOsrmRoute(allWaypoints);
+
+        if (osrmResult) {
+          current.stats.distanceKm = osrmResult.distanceKm;
+          current.routePolyline = osrmResult.coords;
         } else {
-          // Fallback: straight-line via track points
-          const pts = [
-            current.checkIn.coords,
-            ...current.trackPoints.map(p => p.coords),
-            rec.coords,
-          ];
-          current.stats.distanceKm = calculateTotalDistance(pts);
-          current.routePolyline = pts;
+          // Fallback: straight-line between waypoints
+          current.stats.distanceKm = calculateTotalDistance(allWaypoints);
+          current.routePolyline = allWaypoints;
         }
       } catch (e) {
         console.log('Route error in history:', e);
+        current.stats.distanceKm = calculateTotalDistance(allWaypoints);
+        current.routePolyline = allWaypoints;
       }
 
       sessions.push(current);
@@ -99,7 +132,7 @@ const buildSessions = async (history: CheckRecord[]): Promise<Session[]> => {
     }
   }
 
-  // Incomplete session (no check-out yet)
+  // Incomplete session (no check-out yet — ongoing)
   if (current) sessions.push(current);
 
   return sessions;
@@ -177,6 +210,10 @@ const History = () => {
             {item.checkIn.address ? (
               <Text style={s.addrText} numberOfLines={1}>📍 {item.checkIn.address}</Text>
             ) : null}
+            {/* FIX: Show stop count in card header */}
+            {item.trackPoints.length > 0 && (
+              <Text style={s.stopsText}>🔵 {item.trackPoints.length} stops recorded</Text>
+            )}
           </View>
 
           <View style={{ alignItems: 'flex-end', marginLeft: 8 }}>
@@ -214,9 +251,16 @@ const History = () => {
                 pinColor="green"
               />
 
-              {/* Track points: blue */}
-              {item.trackPoints.map((p, i) => (
-                <Marker key={`tp${i}`} coordinate={p.coords} pinColor="blue" opacity={0.6} />
+              {/* FIX: Track points: blue markers with time label */}
+              {item.trackPoints.map((tp, i) => (
+                <Marker
+                  key={`tp-${i}`}
+                  coordinate={tp.coords}
+                  pinColor="blue"
+                  opacity={0.8}
+                  title={`Stop ${i + 1}`}
+                  description={new Date(tp.timestamp).toLocaleTimeString('en-IN')}
+                />
               ))}
 
               {/* Check-out: red */}
@@ -229,7 +273,7 @@ const History = () => {
                 />
               )}
 
-              {/* Road route polyline */}
+              {/* FIX: Full road route polyline through all waypoints */}
               {item.routePolyline.length > 1 && (
                 <Polyline
                   coordinates={item.routePolyline}
@@ -243,6 +287,9 @@ const History = () => {
             <View style={s.statsRow}>
               <Text style={s.statItem}>🛣 {item.stats.distanceKm.toFixed(2)} km</Text>
               <Text style={s.statItem}>⏱ {item.stats.hours}h {item.stats.minutes}m</Text>
+              {item.trackPoints.length > 0 && (
+                <Text style={s.statItem}>📌 {item.trackPoints.length} stops</Text>
+              )}
               {item.checkOut && (
                 <Text style={s.statItem}>
                   📍 {item.checkOut.address ?? 'Checkout location'}
@@ -296,16 +343,12 @@ const History = () => {
 const { height } = Dimensions.get('window');
 
 const s = StyleSheet.create({
-  root: {
-    flex: 1, backgroundColor: '#f3f4f6',
-  },
+  root: { flex: 1, backgroundColor: '#f3f4f6' },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
 
   header: {
     flexDirection: 'row',
-
     marginTop: '10%',
-
     justifyContent: 'space-between',
     alignItems: 'center',
     backgroundColor: '#fff',
@@ -315,11 +358,17 @@ const s = StyleSheet.create({
     borderBottomColor: '#e5e7eb',
   },
   headerTitle: { fontSize: 18, fontWeight: '700', color: '#111827' },
-  clearBtn: { paddingVertical: 6, paddingHorizontal: 12, backgroundColor: '#fee2e2', borderRadius: 6 },
+  clearBtn: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    backgroundColor: '#fee2e2',
+    borderRadius: 6,
+  },
   clearBtnText: { color: '#dc2626', fontWeight: '600', fontSize: 13 },
 
   card: {
     marginHorizontal: 12,
+    marginBottom: 10,
     backgroundColor: '#fff',
     borderRadius: 10,
     overflow: 'hidden',
@@ -341,9 +390,16 @@ const s = StyleSheet.create({
   dateText: { fontSize: 14, fontWeight: '700', color: '#111827' },
   timeText: { fontSize: 12, color: '#6b7280', marginTop: 2 },
   addrText: { fontSize: 12, color: '#374151', marginTop: 3 },
+  stopsText: { fontSize: 11, color: '#2563eb', marginTop: 3, fontWeight: '600' },
 
   statBadge: { fontSize: 13, fontWeight: '600', color: '#1d4ed8', marginBottom: 2 },
-  liveDot: { backgroundColor: '#dcfce7', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, marginTop: 2 },
+  liveDot: {
+    backgroundColor: '#dcfce7',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    marginTop: 2,
+  },
   liveText: { fontSize: 11, color: '#15803d', fontWeight: '700' },
 
   mapWrap: { borderTopWidth: 1, borderTopColor: '#e5e7eb' },

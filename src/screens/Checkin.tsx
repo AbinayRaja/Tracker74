@@ -19,6 +19,7 @@ import {
   getRoadRoute,
   startTracking,
 } from '../helpers/locationHelper';
+import { calculateTimeDifference } from '../helpers/calculateKm';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 interface Coords { latitude: number; longitude: number; }
@@ -39,7 +40,6 @@ const persistRecord = async (record: CheckRecord) => {
     const raw = await AsyncStorage.getItem(HISTORY_KEY);
     let history: CheckRecord[] = raw ? JSON.parse(raw) : [];
     history.push(record);
-    // Keep last 500 records (check-in + track points + check-out)
     if (history.length > 500) history = history.slice(-500);
     await AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(history));
   } catch (e) {
@@ -59,7 +59,9 @@ const Checkin = ({ route }: any) => {
   const [isCheckedIn, setIsCheckedIn] = useState(false);
   const [checkInRecord, setCheckInRecord] = useState<CheckRecord | null>(null);
   const [checkOutRecord, setCheckOutRecord] = useState<CheckRecord | null>(null);
-  const [trackPoints, setTrackPoints] = useState<Coords[]>([]);
+
+  // FIX: trackPoints stores full CheckRecord so we have timestamp + coords
+  const [trackPoints, setTrackPoints] = useState<CheckRecord[]>([]);
   const [routeCoords, setRouteCoords] = useState<Coords[]>([]);
   const [sessionStats, setSessionStats] = useState<{ hours: number; minutes: number; distanceKm: number } | null>(null);
 
@@ -74,26 +76,37 @@ const Checkin = ({ route }: any) => {
 
       // Find the most recent check-in record
       let lastCI: CheckRecord | null = null;
+      let lastCIIdx = -1;
       for (let i = history.length - 1; i >= 0; i--) {
-        if (history[i].type === 'check-in') { lastCI = history[i]; break; }
+        if (history[i].type === 'check-in') { lastCI = history[i]; lastCIIdx = i; break; }
       }
-      if (!lastCI) return;
+      if (!lastCI || lastCIIdx === -1) return;
 
       // Check if there's a subsequent check-out
-      const ciIdx = history.lastIndexOf(lastCI);
-      const hasCheckOut = history.slice(ciIdx + 1).some(r => r.type === 'check-out');
+      const hasCheckOut = history.slice(lastCIIdx + 1).some(r => r.type === 'check-out');
 
       if (!hasCheckOut) {
         setIsCheckedIn(true);
         setCheckInRecord(lastCI);
         setDisplayAddress(lastCI.address ?? 'No address');
 
-        // Restore track points recorded after that check-in
-        const pts = history
-          .slice(ciIdx + 1)
-          .filter(r => r.type === 'track')
-          .map(r => r.coords);
-        setTrackPoints(pts);
+        // Restore full track records (with timestamps) recorded after that check-in
+        const trackRecs = history
+          .slice(lastCIIdx + 1)
+          .filter(r => r.type === 'track');
+        setTrackPoints(trackRecs);
+
+        // Restart tracking since session is still open
+        const stop = startTracking(async (newCoords, ts) => {
+          const trackRec: CheckRecord = {
+            type: 'track',
+            timestamp: ts,
+            coords: { latitude: newCoords.latitude, longitude: newCoords.longitude },
+          };
+          await persistRecord(trackRec);
+          setTrackPoints(prev => [...prev, trackRec]);
+        });
+        stopTrackingRef.current = stop;
       }
     })();
 
@@ -140,7 +153,7 @@ const Checkin = ({ route }: any) => {
       setIsCheckedIn(true);
       setDisplayAddress(address);
 
-      // Start background tracking — each new point saved to history
+      // Start background tracking — saves every 20 minutes
       const stop = startTracking(async (newCoords, ts) => {
         const trackRec: CheckRecord = {
           type: 'track',
@@ -148,7 +161,7 @@ const Checkin = ({ route }: any) => {
           coords: { latitude: newCoords.latitude, longitude: newCoords.longitude },
         };
         await persistRecord(trackRec);
-        setTrackPoints(prev => [...prev, trackRec.coords]);
+        setTrackPoints(prev => [...prev, trackRec]);
       });
       stopTrackingRef.current = stop;
 
@@ -181,9 +194,11 @@ const Checkin = ({ route }: any) => {
         }
       } catch (_) { }
 
+      const checkoutTimestamp = new Date().toISOString();
+
       const record: CheckRecord = {
         type: 'check-out',
-        timestamp: new Date().toISOString(),
+        timestamp: checkoutTimestamp,
         address,
         coords: { latitude: coords.latitude, longitude: coords.longitude },
       };
@@ -193,34 +208,77 @@ const Checkin = ({ route }: any) => {
       setIsCheckedIn(false);
       setDisplayAddress(address);
 
-      // ── Calculate road route ──────────────────────────────────────────
+      // ── FIX: Calculate ACTUAL time from check-in timestamp to check-out ──
       if (checkInRecord) {
-        const result = await getRoadRoute(
-          checkInRecord.coords.latitude,
-          checkInRecord.coords.longitude,
-          coords.latitude,
-          coords.longitude,
-        );
+        const dur = calculateTimeDifference(checkInRecord.timestamp, checkoutTimestamp);
 
-        if (result) {
-          const distKm = Number(result.distanceKm.toFixed(2));
-          const totalMins = Math.round(result.durationMin);
-          const hours = Math.floor(totalMins / 60);
-          const minutes = totalMins % 60;
+        // ── Build full route: checkIn → all trackPoints → checkOut ──────────
+        // FIX: Use OSRM multi-waypoint route through all visited points
+        const allWaypoints: Coords[] = [
+          checkInRecord.coords,
+          ...trackPoints.map(tp => tp.coords),
+          { latitude: coords.latitude, longitude: coords.longitude },
+        ];
 
-          setSessionStats({ hours, minutes, distanceKm: distKm });
+        // Deduplicate consecutive identical coords
+        const uniqueWaypoints = allWaypoints.filter((pt, i) => {
+          if (i === 0) return true;
+          const prev = allWaypoints[i - 1];
+          return !(Math.abs(pt.latitude - prev.latitude) < 0.0001 &&
+            Math.abs(pt.longitude - prev.longitude) < 0.0001);
+        });
 
-          // Decode polyline for the map
-          const decoded = polyline.decode(result.geometry);
-          setRouteCoords(decoded.map(p => ({ latitude: p[0], longitude: p[1] })));
+        let totalDistanceKm = 0;
+        let fullPolylineCoords: Coords[] = [];
 
-          Alert.alert(
-            'Checked Out ✅',
-            `📍 ${address}\n\n🛣 Distance: ${distKm} km\n⏱ Duration: ${hours}h ${minutes}m`,
-          );
-        } else {
-          Alert.alert('Checked Out', `📍 ${address}\n(Route data unavailable)`);
+        if (uniqueWaypoints.length >= 2) {
+          // Build OSRM URL with all waypoints (coordinates format: lon,lat)
+          const waypointStr = uniqueWaypoints
+            .map(p => `${p.longitude},${p.latitude}`)
+            .join(';');
+
+          try {
+            const osrmUrl =
+              `https://router.project-osrm.org/route/v1/driving/${waypointStr}` +
+              `?overview=full&geometries=polyline`;
+
+            const response = await fetch(osrmUrl);
+            const json = await response.json();
+
+            if (json.routes && json.routes.length > 0) {
+              const osrmRoute = json.routes[0];
+              totalDistanceKm = Number((osrmRoute.distance / 1000).toFixed(2));
+              const decoded = polyline.decode(osrmRoute.geometry);
+              fullPolylineCoords = decoded.map((p: number[]) => ({
+                latitude: p[0],
+                longitude: p[1],
+              }));
+            } else {
+              // Fallback: straight lines between waypoints
+              fullPolylineCoords = uniqueWaypoints;
+              const { calculateTotalDistance } = require('../helpers/calculateKm');
+              totalDistanceKm = calculateTotalDistance(uniqueWaypoints);
+            }
+          } catch (routeErr) {
+            console.log('OSRM multi-waypoint error:', routeErr);
+            fullPolylineCoords = uniqueWaypoints;
+            const { calculateTotalDistance } = require('../helpers/calculateKm');
+            totalDistanceKm = calculateTotalDistance(uniqueWaypoints);
+          }
         }
+
+        setSessionStats({
+          hours: dur.hours,
+          minutes: dur.minutes,
+          distanceKm: totalDistanceKm,
+        });
+
+        setRouteCoords(fullPolylineCoords);
+
+        Alert.alert(
+          'Checked Out ✅',
+          `📍 ${address}\n\n🛣 Distance: ${totalDistanceKm} km\n⏱ Duration: ${dur.hours}h ${dur.minutes}m`,
+        );
       }
     } catch (err: any) {
       Alert.alert('Error', err.message ?? 'Failed to check out. Try again.');
@@ -270,9 +328,16 @@ const Checkin = ({ route }: any) => {
               pinColor="green"
             />
 
-            {/* Live track points (blue dots) */}
-            {trackPoints.map((pt, i) => (
-              <Marker key={`t${i}`} coordinate={pt} pinColor="blue" opacity={0.7} />
+            {/* FIX: Track points shown as blue markers on map */}
+            {trackPoints.map((tp, i) => (
+              <Marker
+                key={`track-${i}`}
+                coordinate={tp.coords}
+                pinColor="blue"
+                opacity={0.75}
+                title={`Stop ${i + 1}`}
+                description={new Date(tp.timestamp).toLocaleTimeString('en-IN')}
+              />
             ))}
 
             {/* Check-out marker (red) */}
@@ -285,8 +350,8 @@ const Checkin = ({ route }: any) => {
               />
             )}
 
-            {/* Road route polyline */}
-            {routeCoords.length > 0 && (
+            {/* FIX: Road route polyline through all waypoints */}
+            {routeCoords.length > 1 && (
               <Polyline
                 coordinates={routeCoords}
                 strokeColor="#2563eb"
@@ -334,6 +399,11 @@ const Checkin = ({ route }: any) => {
             <Text style={s.statRow}>
               🛣  Distance:   {sessionStats.distanceKm.toFixed(2)} km
             </Text>
+            {trackPoints.length > 0 && (
+              <Text style={s.statRow}>
+                📌  Stops recorded:   {trackPoints.length}
+              </Text>
+            )}
           </View>
         )}
 
@@ -355,7 +425,7 @@ const Checkin = ({ route }: any) => {
         {/* Status text */}
         {!!statusText && <Text style={s.statusText}>{statusText}</Text>}
         {isCheckedIn && !loading && (
-          <Text style={s.trackingBadge}>🟢 Tracking active — location updates every 20 m</Text>
+          <Text style={s.trackingBadge}>🟢 Tracking active — location saved every 20 minutes</Text>
         )}
 
       </View>
@@ -364,13 +434,9 @@ const Checkin = ({ route }: any) => {
 };
 
 const s = StyleSheet.create({
-  // 🔷 Header (improved)
   header: {
-    // backgroundColor: '#fff',
     paddingHorizontal: 20,
     paddingVertical: 18,
-    // borderBottomLeftRadius: 16,
-    // borderBottomRightRadius: 16,
     elevation: 6,
   },
   headerTitle: {
@@ -381,32 +447,19 @@ const s = StyleSheet.create({
     letterSpacing: 0.5,
   },
 
-  // 🔷 Main Card
   card: {
     margin: 16,
-    marginTop: -20, // overlap effect with header
+    marginTop: -20,
     backgroundColor: '#ffffff',
     borderRadius: 16,
     padding: 16,
     elevation: 5,
   },
 
-  // 🔷 Welcome
-  welcomeRow: {
-    marginBottom: 16,
-  },
-  welcomeName: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: '#111827',
-  },
-  welcomeRole: {
-    fontSize: 13,
-    color: '#6b7280',
-    marginTop: 4,
-  },
+  welcomeRow: { marginBottom: 16 },
+  welcomeName: { fontSize: 20, fontWeight: '700', color: '#111827' },
+  welcomeRole: { fontSize: 13, color: '#6b7280', marginTop: 4 },
 
-  // 🔷 Map
   map: {
     height: 260,
     borderRadius: 14,
@@ -414,74 +467,29 @@ const s = StyleSheet.create({
     overflow: 'hidden',
   },
 
-  // 🔷 Location
-  locationRow: {
-    marginBottom: 14,
-  },
-  locationLabel: {
-    fontSize: 12,
-    color: '#9ca3af',
-    fontWeight: '600',
-    marginBottom: 4,
-  },
-  locationValue: {
-    fontSize: 14,
-    color: '#374151',
-    fontWeight: '500',
-  },
+  locationRow: { marginBottom: 14 },
+  locationLabel: { fontSize: 12, color: '#9ca3af', fontWeight: '600', marginBottom: 4 },
+  locationValue: { fontSize: 14, color: '#374151', fontWeight: '500' },
 
-  // 🔷 Info Cards
   infoCard: {
     borderRadius: 12,
     padding: 14,
     marginBottom: 12,
     borderWidth: 1,
   },
-  infoCardGreen: {
-    backgroundColor: '#ecfdf5',
-    borderColor: '#4ade80',
-  },
-  infoCardRed: {
-    backgroundColor: '#fef2f2',
-    borderColor: '#f87171',
-  },
-  infoCardBlue: {
-    backgroundColor: '#eff6ff',
-    borderColor: '#60a5fa',
-  },
+  infoCardGreen: { backgroundColor: '#ecfdf5', borderColor: '#4ade80' },
+  infoCardRed: { backgroundColor: '#fef2f2', borderColor: '#f87171' },
+  infoCardBlue: { backgroundColor: '#eff6ff', borderColor: '#60a5fa' },
+  infoCardTitle: { fontWeight: '700', fontSize: 15, marginBottom: 6 },
+  infoCardTime: { fontSize: 12, color: '#6b7280', marginBottom: 4 },
+  infoCardAddr: { fontSize: 13, color: '#374151' },
 
-  infoCardTitle: {
-    fontWeight: '700',
-    fontSize: 15,
-    marginBottom: 6,
-  },
-  infoCardTime: {
-    fontSize: 12,
-    color: '#6b7280',
-    marginBottom: 4,
-  },
-  infoCardAddr: {
-    fontSize: 13,
-    color: '#374151',
-  },
+  statRow: { fontSize: 14, color: '#1d4ed8', marginTop: 4, fontWeight: '500' },
 
-  // 🔷 Stats
-  statRow: {
-    fontSize: 14,
-    color: '#1d4ed8',
-    marginTop: 4,
-    fontWeight: '500',
-  },
-
-  // 🔷 Empty text
   noCheckin: {
-    textAlign: 'center',
-    color: '#9ca3af',
-    marginVertical: 16,
-    fontSize: 14,
+    textAlign: 'center', color: '#9ca3af', marginVertical: 16, fontSize: 14,
   },
 
-  // 🔷 Button (modern)
   actionBtn: {
     backgroundColor: '#2563eb',
     borderRadius: 10,
@@ -490,31 +498,13 @@ const s = StyleSheet.create({
     marginTop: 10,
     elevation: 3,
   },
-  actionBtnRed: {
-    backgroundColor: '#dc2626',
-  },
-  actionBtnText: {
-    color: '#ffffff',
-    fontWeight: '700',
-    fontSize: 16,
-    letterSpacing: 1,
-  },
+  actionBtnRed: { backgroundColor: '#dc2626' },
+  actionBtnText: { color: '#ffffff', fontWeight: '700', fontSize: 16, letterSpacing: 1 },
 
-  // 🔷 Status
-  statusText: {
-    textAlign: 'center',
-    color: '#6b7280',
-    fontSize: 13,
-    marginTop: 10,
-  },
+  statusText: { textAlign: 'center', color: '#6b7280', fontSize: 13, marginTop: 10 },
 
-  // 🔷 Tracking badge
   trackingBadge: {
-    textAlign: 'center',
-    color: '#16a34a',
-    fontSize: 12,
-    marginTop: 6,
-    fontWeight: '600',
+    textAlign: 'center', color: '#16a34a', fontSize: 12, marginTop: 6, fontWeight: '600',
   },
 });
 
